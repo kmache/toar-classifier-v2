@@ -1,33 +1,78 @@
 ## TOAR-classifier v2: A data-driven classification tool for global air quality stations
-This notebook implements various machine learning approaches to obtain an objective station classification for global air quality monitoring stations as described in [1]. It has been developed in support of the international Tropospheric Ozone Assessment Report initiative, phase 2 (TOAR-II) [2]. TOAR has implemented a terabyte-scale database for global air quality data [3] with multiannual time series from over 23,000 stations. The objective of the station classification performed in this notebook is to create objective labels for the measurement sites as "urban", "suburban", or "rural" based on various features that provide hints of the characteristics of a station location. To this end, the machine learning models implemented here make use of the extensive metadata in the TOAR database, in particular the "global metadata" that is derived from various Earth Observation satellite data products (for details, see [1])
-<img src="./figures/toar_classifier_v2.png" alt="My image" with="200">
 
-### Files
-- `data/`:  Contains all datasets used in this work, including machine learning model predictions for station categories
-- `figures/`: contains all the figures.
-- `TOAR-classifier_v2.ipynb`: Jupyter notebook containing the implementation.
-- `requirements.txt`: Lists all required Python packages.
+This project implements machine learning approaches to obtain an objective station classification for global air quality monitoring stations as described in [1]. It has been developed in support of the international Tropospheric Ozone Assessment Report initiative, phase 2 (TOAR-II) [2]. 
 
-### Running the Code
+The tool processes metadata from the TOAR database [3]—specifically "global metadata" derived from Earth Observation satellite products—to classify measurement sites as **"urban"**, **"suburban"**, or **"rural"**. This second version (v2) features a modular architecture designed for both research (via notebooks) and production-ready inference (via the `src/` library).
+
+<img src="./figures/toar_classifier_v2.png" alt="TOAR Classifier V2" width="400">
+
+## 📁 Project Structure
+
+The project has been refactored into a modular library to improve maintainability and ease of use:
+
+- **`configs/`**: Placeholder for configuration files and experiment parameters.
+- **`data/`**: Datasets used for training and testing, including machine learning model predictions.
+- **`figures/`**: Visualizations and figures.
+- **`models/`**: Storage for trained model artifacts and processors (`.pkl` files).
+- **`notebooks/`**:
+  - `01_eda_traning.ipynb`: Main Jupyter notebook for exploratory data analysis and model training.
+- **`script/`**: 
+  - `dataloader.py`: Utilities to fetch station metadata from the TOAR-II API.
+- **`src/`**: Core modular codebase:
+  - `processing.py`: Stateful data cleaning and preprocessing (imputation, encoding).
+  - `feature.py`: Feature engineering and extraction from raw metadata.
+  - `modeling.py`: Implementations of unsupervised (KMeans, GMM) and supervised (Ensembles) models.
+  - `inference.py`: End-to-end prediction pipeline for new station codes or datasets.
+  - `evaluator.py`: Performance metrics and validation tools.
+  - `plotting.py`: Visualization utilities for station maps and model results.
+- **`requirements.txt`**: List of required Python packages.
+
+### 🚀 Running the Code
 
 **Tested on:** Ubuntu 24.04 with Python 3.12
 
 ### 🛠 Prerequisites
-Ensure you have Python 3.12 installed along with either Jupyter Notebook, JupyterLab, or VS Code
+Ensure you have Python 3.12 installed along with either Jupyter Notebook, JupyterLab, or VS Code.
 
-1. clone the repository:
-   - `git clone https://gitlab.jsc.fz-juelich.de/esde/toar-public/ml_toar_station_classification.git`
-2. Change directory to ml_toar_station_classification:
-   - `cd ml_toar_station_classification`
-3. Creat virtual environment: 
-   - `python -m venv TOAR-classifier_v2` # feel free to change the virtual environment as convenient 
-4. Activate the virtual environment and register it with Jupyter: 
-   - `python -m ipykernel install --user --name=TOAR-classifier_v2 --display-name "Python (TOAR-classifier_v2)"`
-5. Open the notebook and select kernel:
-   - open jupyter notebook, `jupyter-notebook` and select kernel `TOAR-classifier_v2` (or the name you assigned to your virtual environment).
-6. Install required packages
-   - Uncomment and run the first cell of the notebook to install all required packages.
-7. Run the notebook cell by cell.
+1. **Clone the repository:**
+   ```bash
+   git clone https://gitlab.jsc.fz-juelich.de/esde/toar-public/ml_toar_station_classification.git
+   cd TOAR-Classifer-V2
+   ```
+
+2. **Create and activate a virtual environment:**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate
+   ```
+
+3. **Install required packages:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Register the kernel with Jupyter (Optional):**
+   ```bash
+   python -m ipykernel install --user --name=toar-v2 --display-name "Python (TOAR-V2)"
+   ```
+
+5. **Run the analysis:**
+   Open `notebooks/01_eda_traning.ipynb` and select the `toar-v2` kernel.
+
+## 🛠 Usage (Inference)
+
+You can use the modular `src` library to run predictions for specific stations:
+
+```python
+from src.inference import TOARInference
+
+# Initialize inference pipeline
+infer = TOARInference(models_dir="models", best_model="voting")
+
+# Predict using a list of TOAR station codes
+results = infer.predict(["DE0001A", "FR0123X"])
+print(results[["area_code", "pred_voting"]])
+```
 
 
 [1] Our paper https://egusphere.copernicus.org/preprints/2025/egusphere-2025-1399/
