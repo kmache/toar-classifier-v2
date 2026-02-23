@@ -85,7 +85,7 @@ def get_station_coord(station_code: str) -> dict:
     }
 
 
-def get_data_from_station_code(station_codes: dict[str, list[str]]) -> pd.DataFrame:
+def get_test_data_from_station_code(station_codes: dict[str, list[str]]) -> pd.DataFrame:
     """Fetch test station data for hand-labelled stations and return a DataFrame.
 
     Args:
