@@ -17,7 +17,7 @@ __pycache__/
 
 # Project specific
 catboost_info/
-models/
+models/*.pkl
 
 # OS generated files
 .DS_Store
