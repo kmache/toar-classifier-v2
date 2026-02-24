@@ -9,7 +9,7 @@ Clustering evaluation:
   ari_nmi_clustering(y_true, y_pred)
       Compute Adjusted Rand Index (ARI) and Normalised Mutual Information (NMI).
 
-  evaluate_clustering(X, y_pred, y_true=None)
+  compute_clustering_metrics(X, y_pred, y_true=None)
       Return a dict with silhouette (always) plus ARI/NMI when y_true is given.
 
   clustering_evaluation(df_to_pred, clustering_model, labels_map, ...)
@@ -193,7 +193,7 @@ def ari_nmi_clustering(y_true, y_pred) -> tuple:
     return ari, nmi
 
 
-def evaluate_clustering(X, y_pred, y_true=None) -> dict:
+def compute_clustering_metrics(X, y_pred, y_true=None) -> dict:
     """Compute clustering evaluation metrics.
 
     Always computes the silhouette score (unsupervised).  When *y_true* is
@@ -306,8 +306,7 @@ def clustering_evaluation(
 # ---------------------------------------------------------------------------
 # 2. Statistics evaluation
 # ---------------------------------------------------------------------------
-
-def statistics_evaluation(df_spice: pd.DataFrame, clf, spice: str) -> None:
+def statistics_evaluation(df_spice: pd.DataFrame, clf, spice: str, percentile:str='p75', model: str | None = None) -> None:
     """Evaluate a classifier via box-plot comparison of a pollution species.
 
     Predicts station types with *clf*, then plots the distribution of *spice*
@@ -320,13 +319,35 @@ def statistics_evaluation(df_spice: pd.DataFrame, clf, spice: str) -> None:
         DataFrame containing the features expected by *clf* **and** a column
         named after *spice* plus a ``'type_of_area'`` column for accuracy
         reporting.
-    clf : fitted sklearn-compatible classifier
-        Must expose ``predict()`` and ``feature_names_in_`` / ``feature_names_``.
+    clf : TOARClassifier or fitted sklearn-compatible classifier
+        A ``TOARClassifier`` instance (preferred – handles categorical encoding
+        and label decoding automatically) or a raw fitted estimator.
+        When a ``TOARClassifier`` is passed, *model* must be specified.
     spice : str
         Column name of the species to plot (e.g. ``'nox'``).
+    percentile : str
+        Label for the y-axis (default ``'p75'``).
+    model : str, optional
+        Model name (e.g. ``'rf'``) – required when *clf* is a ``TOARClassifier``.
     """
-    features = _get_features_from_clf(clf)
-    y_pred = clf.predict(df_spice[features])
+    from src.modeling import TOARClassifier
+
+    # Separate the species column from features before predicting
+    drop_cols = [spice]
+    if "type_of_area" in df_spice.columns:
+        drop_cols.append("type_of_area")
+    if "area_code" in df_spice.columns:
+        drop_cols.append("area_code")
+    X = df_spice.drop(columns=[c for c in drop_cols if c in df_spice.columns])
+
+    if isinstance(clf, TOARClassifier):
+        if model is None:
+            raise ValueError("When passing a TOARClassifier, 'model' must be specified (e.g. 'rf').")
+        y_pred = clf.predict(X, model=model)
+    else:
+        features = _get_features_from_clf(clf)
+        y_pred = clf.predict(X[features])
+
     df_plot = df_spice.copy()
     df_plot["type_of_area_pred"] = y_pred
 
@@ -352,7 +373,7 @@ def statistics_evaluation(df_spice: pd.DataFrame, clf, spice: str) -> None:
     )
     plt.title(f"Statistics evaluation – {spice}")
     plt.xlabel("Station location")
-    plt.ylabel(f"p75 of {spice}")
+    plt.ylabel(f"{percentile} of {spice}")
     plt.xticks([0.25, 0.75, 1.25], ["urban", "suburban", "rural"])
     plt.grid(True, alpha=0.3)
     os.makedirs("figures", exist_ok=True)
@@ -392,7 +413,7 @@ def feature_importance(trained_clf) -> pd.DataFrame:
 
 def classifier_evaluation(
     df_to_pred: pd.DataFrame,
-    trained_clfs: dict,
+    trained_clfs,
     apply_threshold: bool = False,
 ) -> pd.DataFrame:
     """Run a full multi-model classification evaluation report.
@@ -406,9 +427,10 @@ def classifier_evaluation(
     df_to_pred : pd.DataFrame
         Labelled DataFrame with at least ``'area_code'`` and ``'type_of_area'``
         columns plus all predictor features.
-    trained_clfs : dict
-        ``{model_name: fitted_classifier}`` mapping, e.g.
-        ``{'rf': rf_clf, 'cboost': cboost_clf, 'lgbm': lgbm_clf}``.
+    trained_clfs : TOARClassifier or dict
+        Either a ``TOARClassifier`` instance (preferred – handles categorical
+        encoding and label decoding automatically) or a plain
+        ``{model_name: fitted_classifier}`` dict for backward compatibility.
     apply_threshold : bool
         If True, apply a grid-searched confidence threshold (may improve macro-F1
         on imbalanced data).
@@ -420,23 +442,49 @@ def classifier_evaluation(
         plus one prediction column per model and a
         ``'type_of_area_pred_voting'`` majority-vote ensemble column.
     """
+    # Import here to avoid circular dependency
+    from src.modeling import TOARClassifier
+
     X_to_pred = df_to_pred.drop(columns=["area_code", "type_of_area"])
     Y_true = df_to_pred["type_of_area"].values
     df_result = df_to_pred[["area_code", "type_of_area"]].copy()
     pred_cols = []
 
-    for model_name, clf in trained_clfs.items():
-        y_pred = _predict(clf, X_to_pred)
-        if apply_threshold:
-            y_proba = _predict_proba(clf, X_to_pred)
-            best_thd, best_score, best_y_pred = _grid_search_threshold_clf(
-                Y_true, y_proba, metric="f1_macro", n_thresholds=50
-            )
-            y_pred = best_y_pred
-            print(
-                f"best threshold for {model_name}: {best_thd:.3f}, "
-                f"best f1_macro: {best_score:.4f}"
-            )
+    # Determine whether we received a TOARClassifier or a raw dict
+    if isinstance(trained_clfs, TOARClassifier):
+        toar_clf = trained_clfs
+        model_items = list(toar_clf.estimators_.items())
+    else:
+        toar_clf = None
+        model_items = list(trained_clfs.items())
+
+    for model_name, clf in model_items:
+        # Use TOARClassifier methods when available (handles OHE / categorical / label decoding)
+        if toar_clf is not None:
+            y_pred = toar_clf.predict(X_to_pred, model=model_name)
+            if apply_threshold:
+                y_proba = toar_clf.predict_proba(X_to_pred, model=model_name)
+                best_thd, best_score, best_y_pred = _grid_search_threshold_clf(
+                    Y_true, y_proba, metric="f1_macro", n_thresholds=50
+                )
+                y_pred = best_y_pred
+                print(
+                    f"best threshold for {model_name}: {best_thd:.3f}, "
+                    f"best f1_macro: {best_score:.4f}"
+                )
+        else:
+            y_pred = _predict(clf, X_to_pred)
+            if apply_threshold:
+                y_proba = _predict_proba(clf, X_to_pred)
+                best_thd, best_score, best_y_pred = _grid_search_threshold_clf(
+                    Y_true, y_proba, metric="f1_macro", n_thresholds=50
+                )
+                y_pred = best_y_pred
+                print(
+                    f"best threshold for {model_name}: {best_thd:.3f}, "
+                    f"best f1_macro: {best_score:.4f}"
+                )
+
         col = f"type_of_area_pred_{model_name}"
         df_result[col] = y_pred
         pred_cols.append(col)
@@ -451,7 +499,9 @@ def classifier_evaluation(
     suburban_mask = df_result["type_of_area"] == "suburban"
     rural_mask    = df_result["type_of_area"] == "rural"
 
-    for model_name, clf in trained_clfs.items():
+    classes = np.array(["rural", "suburban", "urban"], dtype=object)
+
+    for model_name, clf in model_items:
         col = f"type_of_area_pred_{model_name}"
         acc          = accuracy_score(df_result["type_of_area"],           df_result[col])
         acc_urban    = accuracy_score(df_result.loc[urban_mask,    "type_of_area"], df_result.loc[urban_mask,    col])
@@ -469,9 +519,17 @@ def classifier_evaluation(
         print(f"  accuracy for predicting rural:    {acc_rural:.4f}")
         print()
         print("  classification report")
+        # When a TOARClassifier with label encoding is used, clf.classes_
+        # contains integers (0, 1, 2) – always use the string class names.
+        if toar_clf is not None and toar_clf._label_encoder is not None:
+            target_names = classes
+        elif hasattr(clf, "classes_") and all(isinstance(c, str) for c in clf.classes_):
+            target_names = clf.classes_
+        else:
+            target_names = classes
         print(classification_report(
             df_result["type_of_area"], df_result[col],
-            target_names=clf.classes_, digits=4,
+            target_names=target_names, digits=4,
         ))
         print(f"  Balanced accuracy score: {bal_acc:.4f}")
         print()

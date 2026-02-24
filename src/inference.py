@@ -125,6 +125,11 @@ class TOARInference:
         self.processor_: TOARProcessing | None = None
         self.feature_engineer_: TOARFeature | None = None
 
+        # Classifier metadata (categorical handling)
+        self._cat_cols: list[str] = []
+        self._rf_ohe = None
+        self._label_encoder = None
+
         self._load_artifacts()
 
     # ------------------------------------------------------------------
@@ -173,6 +178,15 @@ class TOARInference:
                 f"No classifier model files found in '{models_dir}'. "
                 f"Expected one or more of: {list(_CLASSIFIER_FILES.values())}"
             )
+
+        # -- 4. Classifier metadata (categorical handling) ----------------
+        meta_path = models_dir / "classifier_meta.pkl"
+        if meta_path.exists():
+            meta = joblib.load(meta_path)
+            self._cat_cols = meta.get("_cat_cols", [])
+            self._rf_ohe = meta.get("_rf_ohe", None)
+            self._label_encoder = meta.get("_label_encoder", None)
+            print(f"✅ Classifier metadata loaded from: {meta_path.resolve()}")
 
         # Validate best_model is among loaded models (or 'voting')
         if self.best_model is not None:
@@ -232,11 +246,37 @@ class TOARInference:
     # Preprocessing helpers
     # ------------------------------------------------------------------
 
-    def _preprocess(self, raw_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply processor → feature engineer to produce the feature matrix."""
+    def _preprocess(self, raw_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Index]:
+        """Apply processor → feature engineer to produce the feature matrix.
+
+        Returns
+        -------
+        X : pd.DataFrame
+            Feature matrix (rows may be fewer than input due to cleaning).
+        surviving_idx : pd.Index
+            Original integer positions (from ``raw_df``) that survived
+            the preprocessing steps, used to align identifiers.
+        """
         df_clean = self.processor_.transform(raw_df)
+
         X = self.feature_engineer_.transform(df_clean)
-        return X
+
+        # Map surviving (lat, lon) back to original row positions.
+        # The processor deduplicates by keeping the first occurrence of each
+        # (lat, lon) pair, so we must do the same when mapping back — using
+        # ``isin`` alone would match *all* duplicates and inflate the count.
+        raw_indexed = raw_df.reset_index(drop=True)
+        first_occ = raw_indexed.drop_duplicates(subset=["lat", "lon"], keep="first")
+        latlon_to_pos = {
+            (row["lat"], row["lon"]): idx
+            for idx, row in first_occ.iterrows()
+        }
+
+        surviving_positions = pd.Index(
+            [latlon_to_pos[idx] for idx in X.index if idx in latlon_to_pos]
+        )
+
+        return X, surviving_positions
 
     # ------------------------------------------------------------------
     # Per-model prediction
@@ -263,11 +303,40 @@ class TOARInference:
             f"{type(clf).__name__} does not expose known feature-name attributes."
         )
 
-    def _predict_one(self, clf, X: pd.DataFrame) -> np.ndarray:
+    def _prepare_X(self, name: str, X: pd.DataFrame) -> pd.DataFrame:
+        """Return a model-specific copy of X with categoricals handled.
+
+        Strategy per model
+        ------------------
+        rf       : OHE (sklearn has no native categorical support)
+        catboost : pass strings as-is; handled natively
+        lgbm     : cast to pd.Categorical
+        xgb      : cast to pd.Categorical (requires enable_categorical=True)
+        """
+        cat_cols = [c for c in self._cat_cols if c in X.columns]
+        if not cat_cols:
+            return X
+        X = X.copy()
+        if name == "rf" and self._rf_ohe is not None:
+            ohe_arr = self._rf_ohe.transform(X[cat_cols])
+            ohe_cols = self._rf_ohe.get_feature_names_out(cat_cols).tolist()
+            ohe_df = pd.DataFrame(ohe_arr, columns=ohe_cols, index=X.index)
+            X = pd.concat([X.drop(columns=cat_cols), ohe_df], axis=1)
+        elif name in ("lgbm", "xgb"):
+            for col in cat_cols:
+                X[col] = X[col].astype("category")
+        # catboost: strings are native – no transformation needed
+        return X
+
+    def _predict_one(self, name: str, clf, X: pd.DataFrame) -> np.ndarray:
+        X = self._prepare_X(name, X)
         features = self._get_feature_names(clf)
         # Align columns; missing columns are filled with 0
         X_aligned = X.reindex(columns=features, fill_value=0)
-        return clf.predict(X_aligned).reshape(-1)
+        preds = clf.predict(X_aligned).reshape(-1)
+        if self._label_encoder is not None:
+            preds = self._label_encoder.inverse_transform(preds.astype(int))
+        return preds
 
     # ------------------------------------------------------------------
     # Public predict
@@ -276,6 +345,7 @@ class TOARInference:
     def predict(
         self,
         data: pd.DataFrame | dict | list | str,
+        output_format: str | None = None,
     ) -> pd.DataFrame | list[dict]:
         """Run the full inference pipeline.
 
@@ -283,6 +353,9 @@ class TOARInference:
         ----------
         data : pd.DataFrame | dict | list[dict] | str | list[str]
             Input data in any of the supported formats (see module docstring).
+        output_format : str | None
+            ``"dataframe"`` or ``"dicts"``.  When ``None`` (default), uses
+            the instance-level ``self.output_format`` set at init time.
 
         Returns
         -------
@@ -295,13 +368,18 @@ class TOARInference:
         """
         raw_df, identifiers = self._normalise_input(data)
 
-        # Build feature matrix
-        X = self._preprocess(raw_df)
+        # Build feature matrix (may drop rows during cleaning)
+        X, surviving_positions = self._preprocess(raw_df)
+
+        # Separate surviving vs dropped identifiers
+        all_positions = identifiers.index
+        dropped_positions = all_positions.difference(surviving_positions)
+        id_survived = identifiers.loc[surviving_positions].reset_index(drop=True)
 
         # -- Collect per-model predictions --------------------------------
         preds: dict[str, np.ndarray] = {}
         for name, clf in self.models_.items():
-            preds[name] = self._predict_one(clf, X)
+            preds[name] = self._predict_one(name, clf, X)
 
         # -- Majority-vote ensemble ---------------------------------------
         if len(preds) > 1:
@@ -324,13 +402,22 @@ class TOARInference:
         else:
             selected_preds = preds
 
-        # -- Build result DataFrame ---------------------------------------
-        result = identifiers.copy()
+        # -- Build result DataFrame for survived rows ---------------------
+        result = id_survived.copy()
         for model_name, arr in selected_preds.items():
             result[f"pred_{model_name}"] = arr
 
+        # -- Re-attach dropped rows with sentinel message -----------------
+        _NO_DATA_MSG = "not enough data for prediction"
+        if not dropped_positions.empty:
+            dropped = identifiers.loc[dropped_positions].reset_index(drop=True)
+            for model_name in selected_preds:
+                dropped[f"pred_{model_name}"] = _NO_DATA_MSG
+            result = pd.concat([result, dropped], ignore_index=True)
+
         # -- Return -------------------------------------------------------
-        if self.output_format == "dicts":
+        fmt = output_format or self.output_format
+        if fmt == "dicts":
             return result.to_dict(orient="records")
         return result
 

@@ -15,6 +15,10 @@ Typical training workflow:
     X_train     = feature_eng.fit_transform(df_train)
     feature_eng.save('models/feature_engineer.pkl')
 
+Typical training workflow (tree-based, no encoding/scaling):
+    feature_eng = TOARFeature(encode_categories=False, scale_features=False)
+    X_train     = feature_eng.fit_transform(df_train)
+
 Typical inference workflow:
     feature_eng = TOARFeature.load('models/feature_engineer.pkl')
     X_new       = feature_eng.transform(new_df)
@@ -22,8 +26,6 @@ Typical inference workflow:
 
 import warnings
 from pathlib import Path
-import sys
-import os
 
 import joblib
 import numpy as np
@@ -39,10 +41,6 @@ from sklearn.preprocessing import (
 
 warnings.filterwarnings("ignore")
 
-# Re-use the column schema from processing to stay DRY
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from src.processing import NUM_VARS
-
 
 class TOARFeature(BaseEstimator, TransformerMixin):
     """Feature engineering pipeline for TOAR station metadata.
@@ -50,6 +48,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
     Applies the following steps in order (all learned on training data only):
         1.  Column selection.
         2.  IQR-based outlier capping (optional).
+        2b. Categorical string normalisation: strips float-suffixes (e.g. '8.0' → '8')
+            from all categorical columns and casts non-encoded ones to ``category`` dtype.
         3.  Categorical encoding: OHE or Label Encoding (optional).
         4.  Numeric conversion of specified categorical columns (optional).
         5.  Skewness correction via Yeo-Johnson PowerTransformer (optional).
@@ -97,8 +97,10 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         selected_columns: list[str] | None = None,
         scaling: str | None = None,
         scale_only: str = "numeric",
+        scale_features: bool = True,
         cat_encoder: str | None = None,
         encode_vars: list[str] | None = None,
+        encode_categories: bool = True,
         convert_vars: list[str] | None = None,
         cap_outliers: bool = False,
         handle_skewness: bool = True,
@@ -106,11 +108,20 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         self.selected_columns = selected_columns
         self.scaling = scaling
         self.scale_only = scale_only
+        self.scale_features = scale_features
         self.cat_encoder = cat_encoder
         self.encode_vars = encode_vars
+        self.encode_categories = encode_categories
         self.convert_vars = convert_vars
         self.cap_outliers = cap_outliers
         self.handle_skewness = handle_skewness
+
+        # Lazy import: avoids module-level cross-import that breaks %autoreload
+        from src.processing import NUM_VARS, CAT_VARS
+
+        # Snapshot column schemas so they survive pickling
+        self._num_vars: list[str] = list(NUM_VARS)
+        self._cat_vars: list[str] = list(CAT_VARS)
 
         # Learned state
         self._scaler: StandardScaler | MinMaxScaler | RobustScaler | None = None
@@ -134,9 +145,48 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         cols = [c for c in cols if c in df.columns]
         return df[cols].copy()
 
+    def _clean_categorical_strings(
+        self,
+        df: pd.DataFrame,
+        encode_vars: list[str],
+    ) -> pd.DataFrame:
+        """Step 2b: normalise categorical string columns.
+
+        TOARProcessing stores parsed categorical columns (e.g.
+        ``'climatic_zone_year2016'``) as strings like ``'8.0'`` because the
+        values pass through ``pd.to_numeric`` (float) and then ``astype(str)``.
+        This step:
+
+        1. Strips the trailing ``'.0'`` float-suffix → ``'8.0'`` becomes ``'8'``.
+        2. Casts columns that are **not** being encoded to pandas ``category``
+           dtype, which is more memory-efficient and required by some
+           tree-based models (CatBoost, LightGBM).
+
+        Columns in *encode_vars* are cleaned but kept as plain ``str`` so
+        that OHE / LE receives consistent category values.
+        """
+        skip = {"area_code", "type_of_area"}
+        cat_cols = [
+            c for c in self._cat_vars
+            if c in df.columns and c not in skip
+        ]
+        # 1. Strip float-suffix from all categorical string columns
+        for col in cat_cols:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.replace(r"\.0$", "", regex=True)
+            )
+        # 2. Cast non-encoded columns to category dtype
+        non_encoded = [c for c in cat_cols if c not in encode_vars]
+        for col in non_encoded:
+            df[col] = df[col].astype("category")
+        return df
+
     def _resolve_numeric_cols(self, df: pd.DataFrame) -> list[str]:
         """Return the numeric columns that are also in NUM_VARS."""
-        return [c for c in df.select_dtypes(include="number").columns if c in NUM_VARS]
+        return [c for c in df.select_dtypes(include="number").columns if c in self._num_vars]
 
     def _build_scaler(self) -> StandardScaler | MinMaxScaler | RobustScaler:
         if self.scaling == "standard":
@@ -172,6 +222,9 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         for var in convert_vars:
             df[var] = pd.to_numeric(df[var], errors="coerce")
 
+        # Step 2b: normalise categorical string columns (strip '8.0' → '8', cast to category)
+        df = self._clean_categorical_strings(df, encode_vars)
+
         self._numeric_cols = self._resolve_numeric_cols(df)
 
         # Step 2: learn IQR bounds
@@ -188,7 +241,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 df[col] = df[col].clip(lower=lo, upper=hi)
 
         # Step 3: fit encoders
-        if encode_vars and self.cat_encoder:
+        if self.encode_categories and encode_vars and self.cat_encoder:
             if self.cat_encoder == "ohe":
                 # Fit = just record OHE output column names using training data
                 df = pd.get_dummies(df, columns=encode_vars, drop_first=True, dtype=float)
@@ -201,6 +254,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                     df[var] = le.transform(df[var].astype(str))
             else:
                 raise ValueError("cat_encoder must be 'ohe' or 'le'.")
+        elif not self.encode_categories:
+            print("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Refresh numeric cols after encoding (OHE may add columns)
         self._numeric_cols = self._resolve_numeric_cols(df)
@@ -211,10 +266,14 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             self._skewed_cols = skewness[skewness > 1].index.tolist()
             if self._skewed_cols:
                 self._power_transformer = PowerTransformer(method="yeo-johnson")
-                self._power_transformer.fit(df[self._skewed_cols])
+                # fit AND apply so the scaler below sees the same distribution
+                # that transform() will produce
+                df[self._skewed_cols] = self._power_transformer.fit_transform(
+                    df[self._skewed_cols]
+                )
 
         # Step 6: resolve and fit scaler
-        if self.scaling:
+        if self.scale_features and self.scaling:
             if self.scale_only == "numeric":
                 self._cols_to_scale = self._numeric_cols
             elif self.scale_only == "all":
@@ -223,17 +282,18 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 raise ValueError(f"scale_only must be 'numeric' or 'all', got '{self.scale_only}'.")
             self._scaler = self._build_scaler()
             self._scaler.fit(df[self._cols_to_scale])
+        elif not self.scale_features:
+            print("⏭️  Feature scaling skipped (scale_features=False).")
 
         self._is_fitted = True
         print("✅ TOARFeature fitted successfully!")
         return self
 
-    def transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Apply learned feature engineering to new data.
 
         Args:
             X: Preprocessed (post-TOARProcessing) DataFrame.
-            y: Ignored.
 
         Returns:
             Transformed feature DataFrame.
@@ -253,13 +313,16 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         for var in convert_vars:
             df[var] = pd.to_numeric(df[var], errors="coerce")
 
+        # Step 2b: normalise categorical string columns (strip '8.0' → '8', cast to category)
+        df = self._clean_categorical_strings(df, encode_vars)
+
         # Step 2: apply IQR capping using learned bounds
         for col, (lo, hi) in self._iqr_bounds.items():
             if col in df.columns:
                 df[col] = df[col].clip(lower=lo, upper=hi)
 
         # Step 3: apply encoders
-        if encode_vars and self.cat_encoder:
+        if self.encode_categories and encode_vars and self.cat_encoder:
             if self.cat_encoder == "ohe":
                 df = pd.get_dummies(df, columns=encode_vars, drop_first=True, dtype=float)
                 # Align columns with training — add missing cols as 0, drop extra cols
@@ -277,6 +340,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                             lambda x: x if x in known else le.classes_[0]
                         )
                         df[var] = le.transform(df[var])
+        elif not self.encode_categories:
+            print("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Step 5: apply PowerTransformer to skewed columns
         if self._power_transformer is not None and self._skewed_cols:
@@ -285,10 +350,12 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 df[present_skewed] = self._power_transformer.transform(df[present_skewed])
 
         # Step 6: apply scaling
-        if self._scaler is not None and self._cols_to_scale:
+        if self.scale_features and self._scaler is not None and self._cols_to_scale:
             present_scale_cols = [c for c in self._cols_to_scale if c in df.columns]
             if present_scale_cols:
                 df[present_scale_cols] = self._scaler.transform(df[present_scale_cols])
+        elif not self.scale_features:
+            print("⏭️  Feature scaling skipped (scale_features=False).")
 
         print(f"✅ Feature engineering complete! Shape: {df.shape}")
         return df
@@ -310,6 +377,10 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         # Step 4: convert to numeric
         for var in convert_vars:
             df[var] = pd.to_numeric(df[var], errors="coerce")
+
+        # Step 2b: normalise categorical string columns (strip '8.0' → '8', cast to category)
+        df = self._clean_categorical_strings(df, encode_vars)
+
         self._numeric_cols = self._resolve_numeric_cols(df)
 
         # Step 2: learn + apply IQR capping
@@ -325,7 +396,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             print(f"✅ Outlier capping applied to {len(self._iqr_bounds)} columns!")
 
         # Step 3: fit + apply encoders
-        if encode_vars and self.cat_encoder:
+        if self.encode_categories and encode_vars and self.cat_encoder:
             if self.cat_encoder == "ohe":
                 df = pd.get_dummies(df, columns=encode_vars, drop_first=True, dtype=float)
                 self._ohe_columns = df.columns.tolist()
@@ -338,6 +409,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 print(f"✅ Label encoded {len(encode_vars)} variables: {encode_vars}")
             else:
                 raise ValueError("cat_encoder must be 'ohe' or 'le'.")
+        elif not self.encode_categories:
+            print("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Refresh numeric cols after encoding
         self._numeric_cols = self._resolve_numeric_cols(df)
@@ -352,7 +425,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 print(f"✅ Yeo-Johnson applied to {len(self._skewed_cols)} skewed columns!")
 
         # Step 6: fit + apply scaler
-        if self.scaling:
+        if self.scale_features and self.scaling:
             if self.scale_only == "numeric":
                 self._cols_to_scale = self._numeric_cols
             elif self.scale_only == "all":
@@ -362,6 +435,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             self._scaler = self._build_scaler()
             df[self._cols_to_scale] = self._scaler.fit_transform(df[self._cols_to_scale])
             print(f"✅ {self.scaling} scaling applied to {self.scale_only} features!")
+        elif not self.scale_features:
+            print("⏭️  Feature scaling skipped (scale_features=False).")
 
         self._is_fitted = True
         print(f"✅ Feature engineering complete! Shape: {df.shape}")

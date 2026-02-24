@@ -11,4 +11,6 @@ cartopy
 kmodes
 imblearn 
 ipykernel
+jupyter
 xgboost
+pyyaml

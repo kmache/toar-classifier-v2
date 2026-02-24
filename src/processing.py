@@ -15,13 +15,17 @@ Typical training workflow:
     df_clean  = processor.fit_transform(raw_train_df)
     processor.save('models/processor.pkl')
 
+Typical training workflow (tree-based, no imputation):
+    processor = TOARProcessing(filter_nan='any', impute_nan=False)
+    df_clean  = processor.fit_transform(raw_train_df)
+
 Typical inference workflow:
     processor = TOARProcessing.load('models/processor.pkl')
     df_clean  = processor.transform(new_raw_df)
 
 Standalone helpers (parse_vars, timezone_mapping, group_landcover_cat,
-iterative_imputer) are kept public so they can be used independently or
-in custom sklearn Pipelines.
+iterative_imputer, read_stat_data, prepare_data_for_stat_eval) are kept
+public so they can be used independently or in custom sklearn Pipelines.
 """
 
 import warnings
@@ -245,8 +249,8 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         6. Replace sentinel values (-999, -9999, 9999) with NaN.
         7. Drop rows where all/any values in nan_subset are NaN.
         8. Cross-fill altitude <-> topography_srtm_alt_90m.
-        9. Impute remaining numeric NaNs (IterativeImputer or mean).
-        10. Impute remaining categorical NaNs (most-frequent).
+        9. Impute remaining numeric NaNs (IterativeImputer or mean) — skipped if impute_nan=False.
+        10. Impute remaining categorical NaNs (most-frequent) — skipped if impute_nan=False.
         11. Remove rows with negative road_distance (data quality filter).
         12. Cast categorical columns to str dtype.
 
@@ -256,6 +260,10 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                     'all' drops only rows missing all of them.
         num_imputer: Estimator for numeric imputation.
                      None -> BayesianRidge, 'rf', 'lgbm', 'cboost', or 'mean'.
+        impute_nan: If True (default), impute numeric and categorical NaNs
+                    (steps 9-10). If False, skip imputation entirely — useful
+                    for tree-based models (XGBoost, LightGBM, CatBoost) that
+                    handle NaN values natively.
         display_duplicate: If True, prints duplicate rows found during fit.
 
     Attributes:
@@ -267,6 +275,10 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         >>> processor = TOARProcessing(filter_nan='any', num_imputer=None)
         >>> df_clean = processor.fit_transform(raw_df)
         >>> df_new_clean = processor.transform(new_raw_df)
+
+        # Skip imputation for tree-based models:
+        >>> processor = TOARProcessing(impute_nan=False)
+        >>> df_clean = processor.fit_transform(raw_df)
     """
 
     def __init__(
@@ -274,17 +286,29 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         nan_subset: list[str] = NAN_SUBSET,
         filter_nan: str = "any",
         num_imputer: str | None = None,
+        impute_nan: bool = True,
         display_duplicate: bool = False,
     ) -> None:
         self.nan_subset = nan_subset
         self.filter_nan = filter_nan
         self.num_imputer = num_imputer
+        self.impute_nan = impute_nan
         self.display_duplicate = display_duplicate
+
+        # Snapshot column schemas so they survive pickling
+        self._num_vars: list[str] = list(NUM_VARS)
+        self._cat_vars: list[str] = list(CAT_VARS)
 
         # State learned during fit
         self._cat_imputer: SimpleImputer | None = None
         self._num_simple_imputer: SimpleImputer | None = None
         self._is_fitted: bool = False
+
+    # Bind module-level helpers so they survive pickling / %autoreload
+    _timezone_mapping = staticmethod(timezone_mapping)
+    _parse_vars = staticmethod(parse_vars)
+    _group_landcover_cat = staticmethod(group_landcover_cat)
+    _iterative_imputer = staticmethod(iterative_imputer)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -309,9 +333,9 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         print(f"✅ {n_before - dataset.shape[0]} duplicate rows removed!")
 
         # Steps 3-5: structural encodings
-        dataset = timezone_mapping(dataset)
-        dataset = parse_vars(dataset)
-        dataset = group_landcover_cat(dataset)
+        dataset = self._timezone_mapping(dataset)
+        dataset = self._parse_vars(dataset)
+        dataset = self._group_landcover_cat(dataset)
         print("✅ Parsed timezone and categorical variables!")
 
         # Step 6: replace sentinel missing-value codes
@@ -324,11 +348,13 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         # Step 7: filter rows with too many NaN in key columns
         present_nan_subset = [c for c in self.nan_subset if c in dataset.columns]
         print(f"Initial data size: {init_shape}")
+        n_before = dataset.shape[0]
         if self.filter_nan == "all":
             dataset = dataset[~dataset[present_nan_subset].isna().all(axis=1)]
         else:
             dataset = dataset[~dataset[present_nan_subset].isna().any(axis=1)]
-        print(f"✅ Rows with filter_nan={self.filter_nan!r} applied on nan_subset!")
+        n_dropped_nan = n_before - dataset.shape[0]
+        print(f"✅ NaN filter (filter_nan={self.filter_nan!r}): {n_dropped_nan} rows dropped ({dataset.shape[0]} remaining).")
 
         # Step 8: cross-fill altitude <-> topography srtm
         if "altitude" in dataset.columns and "mean_topography_srtm_alt_90m_year1994" in dataset.columns:
@@ -350,7 +376,7 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
 
         Args:
             X: Raw station metadata DataFrame.
-            y: Ignored (kept for sklearn API compatibility).
+            y: Ignored (sklearn Pipeline compatibility).
 
         Returns:
             self
@@ -358,32 +384,34 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         dataset = X.copy()
         dataset = self._apply_structural_cleaning(dataset, is_fit=True)
 
-        present_num_vars = [c for c in NUM_VARS if c in dataset.columns]
-        cat_cols = [c for c in CAT_VARS if c in dataset.columns]
+        present_num_vars = [c for c in self._num_vars if c in dataset.columns]
+        cat_cols = [c for c in self._cat_vars if c in dataset.columns]
         cat_cols_to_impute = [
             c for c in cat_cols if c not in ("area_code", "timezone", "type_of_area")
         ]
 
         # Step 9: fit numeric imputer
-        if self.num_imputer == "mean":
-            self._num_simple_imputer = SimpleImputer(strategy="mean")
-            self._num_simple_imputer.fit(dataset[present_num_vars])
+        if self.impute_nan:
+            if self.num_imputer == "mean":
+                self._num_simple_imputer = SimpleImputer(strategy="mean")
+                self._num_simple_imputer.fit(dataset[present_num_vars])
 
-        # Step 10: fit categorical imputer
-        if cat_cols_to_impute:
-            self._cat_imputer = SimpleImputer(strategy="most_frequent")
-            self._cat_imputer.fit(dataset[cat_cols_to_impute])
+            # Step 10: fit categorical imputer
+            if cat_cols_to_impute:
+                self._cat_imputer = SimpleImputer(strategy="most_frequent")
+                self._cat_imputer.fit(dataset[cat_cols_to_impute])
+        else:
+            print("⏭️  Imputation skipped (impute_nan=False).")
 
         self._is_fitted = True
         print("✅ TOARProcessing fitted successfully!")
         return self
 
-    def transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Apply the learned preprocessing to new data.
 
         Args:
             X: Raw station metadata DataFrame.
-            y: Ignored.
 
         Returns:
             Preprocessed DataFrame.
@@ -397,33 +425,39 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         dataset = X.copy()
         dataset = self._apply_structural_cleaning(dataset, is_fit=False)
 
-        present_num_vars = [c for c in NUM_VARS if c in dataset.columns]
-        cat_cols = [c for c in CAT_VARS if c in dataset.columns]
+        present_num_vars = [c for c in self._num_vars if c in dataset.columns]
+        cat_cols = [c for c in self._cat_vars if c in dataset.columns]
         cat_cols_to_impute = [
             c for c in cat_cols if c not in ("area_code", "timezone", "type_of_area")
         ]
 
         # Step 9: apply numeric imputation
-        if self.num_imputer == "mean" and self._num_simple_imputer is not None:
-            dataset[present_num_vars] = self._num_simple_imputer.transform(
-                dataset[present_num_vars]
-            )
-        else:
-            dataset = iterative_imputer(
-                dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
-            )
-        print("✅ Numeric missing values imputed!")
+        if self.impute_nan:
+            if self.num_imputer == "mean" and self._num_simple_imputer is not None:
+                dataset[present_num_vars] = self._num_simple_imputer.transform(
+                    dataset[present_num_vars]
+                )
+            else:
+                dataset = self._iterative_imputer(
+                    dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
+                )
+            print("✅ Numeric missing values imputed!")
 
-        # Step 10: apply categorical imputation
-        if cat_cols_to_impute and self._cat_imputer is not None:
-            dataset[cat_cols_to_impute] = self._cat_imputer.transform(
-                dataset[cat_cols_to_impute]
-            )
-        print("✅ Categorical missing values imputed!")
+            # Step 10: apply categorical imputation
+            if cat_cols_to_impute and self._cat_imputer is not None:
+                dataset[cat_cols_to_impute] = self._cat_imputer.transform(
+                    dataset[cat_cols_to_impute]
+                )
+            print("✅ Categorical missing values imputed!")
+        else:
+            print("⏭️  Imputation skipped (impute_nan=False).")
 
         # Step 11: remove rows with negative road distance (data quality)
         if "distance_to_major_road_year2020" in dataset.columns:
+            n_before = dataset.shape[0]
             dataset = dataset[dataset["distance_to_major_road_year2020"] >= 0]
+            n_dropped_road = n_before - dataset.shape[0]
+            print(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
 
         # Step 12: cast categorical columns to str
         for col in cat_cols:
@@ -438,7 +472,7 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
 
         Args:
             X: Raw station metadata DataFrame.
-            y: Ignored.
+            y: Ignored (sklearn Pipeline compatibility).
 
         Returns:
             Preprocessed DataFrame.
@@ -446,35 +480,41 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         dataset = X.copy()
         dataset = self._apply_structural_cleaning(dataset, is_fit=True)
 
-        present_num_vars = [c for c in NUM_VARS if c in dataset.columns]
-        cat_cols = [c for c in CAT_VARS if c in dataset.columns]
+        present_num_vars = [c for c in self._num_vars if c in dataset.columns]
+        cat_cols = [c for c in self._cat_vars if c in dataset.columns]
         cat_cols_to_impute = [
             c for c in cat_cols if c not in ("area_code", "timezone", "type_of_area")
         ]
 
         # Numeric imputation (fit + transform)
-        if self.num_imputer == "mean":
-            self._num_simple_imputer = SimpleImputer(strategy="mean")
-            dataset[present_num_vars] = self._num_simple_imputer.fit_transform(
-                dataset[present_num_vars]
-            )
-        else:
-            dataset = iterative_imputer(
-                dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
-            )
-        print("✅ Numeric missing values imputed!")
+        if self.impute_nan:
+            if self.num_imputer == "mean":
+                self._num_simple_imputer = SimpleImputer(strategy="mean")
+                dataset[present_num_vars] = self._num_simple_imputer.fit_transform(
+                    dataset[present_num_vars]
+                )
+            else:
+                dataset = self._iterative_imputer(
+                    dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
+                )
+            print("✅ Numeric missing values imputed!")
 
-        # Categorical imputation (fit + transform)
-        if cat_cols_to_impute:
-            self._cat_imputer = SimpleImputer(strategy="most_frequent")
-            dataset[cat_cols_to_impute] = self._cat_imputer.fit_transform(
-                dataset[cat_cols_to_impute]
-            )
-        print("✅ Categorical missing values imputed!")
+            # Categorical imputation (fit + transform)
+            if cat_cols_to_impute:
+                self._cat_imputer = SimpleImputer(strategy="most_frequent")
+                dataset[cat_cols_to_impute] = self._cat_imputer.fit_transform(
+                    dataset[cat_cols_to_impute]
+                )
+            print("✅ Categorical missing values imputed!")
+        else:
+            print("⏭️  Imputation skipped (impute_nan=False).")
 
         # Road distance quality filter
         if "distance_to_major_road_year2020" in dataset.columns:
+            n_before = dataset.shape[0]
             dataset = dataset[dataset["distance_to_major_road_year2020"] >= 0]
+            n_dropped_road = n_before - dataset.shape[0]
+            print(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
 
         # Cast categoricals to str
         for col in cat_cols:
@@ -629,6 +669,125 @@ def prepare_train_test_data(
         print(f"Hand-labeled test shape : {hand_labeled_test_data.shape}")
 
     return df_train, df_test, hand_labeled_test_data
+
+
+# ---------------------------------------------------------------------------
+# Statistical-evaluation data helpers
+# ---------------------------------------------------------------------------
+
+def read_stat_data(
+    data_dir: str | Path = "data",
+    percentile: str = "p75",
+    species: str | list[str] | None = None,
+) -> pd.DataFrame:
+    """Load per-species percentile CSVs and merge them into a single DataFrame.
+
+    Each CSV is expected to live at ``<data_dir>/<species>/<percentile>.csv``
+    and to contain at least ``lat``, ``lon``, and ``value`` columns.
+    Duplicate (lat, lon) pairs are removed (both entries dropped) to avoid
+    ambiguous merges, which matches the original notebook logic.
+
+    Args:
+        data_dir: Root data directory (absolute or relative to the working
+            directory).  Defaults to ``'data'``.
+        percentile: Filename stem to load, e.g. ``'median'``, ``'p75'``,
+            ``'p90'``, ``'p95'``.  Defaults to ``'p75'``.
+        species: Species sub-directory (or list of sub-directories) to load.
+            Accepts a single string (e.g. ``'no2'``) or a list of strings
+            (e.g. ``['no2', 'nox']``).  Defaults to ``['no2', 'nox', 'pm2p5']``
+            when *None*.
+
+    Returns:
+        DataFrame indexed by ``(lat, lon)`` with one column per species.
+        When multiple species are requested the result contains only rows
+        present in **all** DataFrames (inner join).  When a single species
+        string is passed the result is a one-column DataFrame (no join needed).
+
+    Examples:
+        >>> df_stat = read_stat_data(data_dir='data', percentile='p75')
+        >>> df_stat.columns
+        Index(['no2', 'nox', 'pm2p5'], dtype='object')
+
+        >>> df_no2 = read_stat_data(data_dir='data', species='no2')
+        >>> df_no2.columns
+        Index(['no2'], dtype='object')
+    """
+    if species is None:
+        species = ["no2", "nox", "pm2p5"]
+    elif isinstance(species, str):
+        species = [species]
+
+    data_dir = Path(data_dir)
+
+    def _load_species(name: str) -> pd.DataFrame:
+        path = data_dir / name / f"{percentile}.csv"
+        df = pd.read_csv(path, comment="#")
+        df.set_index(["lat", "lon"], inplace=True)
+        # Drop both entries when duplicates exist (keep=False)
+        df = df.loc[~df.index.duplicated(keep=False)]
+        df = df.rename(columns={"value": name})
+        df = df[[name]]          # keep only the species column
+        df = df.dropna()
+        return df
+
+    frames = [_load_species(s) for s in species]
+    df_merged = frames[0].join(frames[1:], how="inner")
+    return df_merged
+
+def prepare_data_for_stat_eval(
+    df_clean: pd.DataFrame,
+    df_spice: pd.DataFrame,
+    know_station_only: bool = False,
+    n_sample: int | None = 1000,
+) -> pd.DataFrame:
+    """Merge station metadata with species statistics and optionally sub-sample.
+
+    Joins *df_clean* (station features + ``'type_of_area'``) with *df_spice*
+    (species percentile values) on their shared ``(lat, lon)`` index, then
+    optionally restricts to known station types and draws a balanced sample.
+
+    Args:
+        df_clean: Pre-processed station metadata DataFrame indexed by
+            ``(lat, lon)``.  Must contain a ``'type_of_area'`` column.
+        df_spice: Species statistics DataFrame indexed by ``(lat, lon)``.
+            Typically the output of :func:`read_stat_data`.
+        know_station_only: If True, rows labelled ``'unknown'`` are removed
+            before sampling.  Defaults to False.
+        n_sample: Total number of rows to return when *know_station_only* is
+            True.  The sample is balanced across the three station types:
+            urban, suburban, and rural.  Set to ``None`` to return all rows
+            without sub-sampling.  Defaults to 1000.
+
+    Returns:
+        Merged (and optionally sampled) DataFrame.
+
+    Example:
+        >>> df_stat = read_stat_data()
+        >>> df_eval = prepare_data_for_stat_eval(df_clean, df_stat,
+        ...                                      know_station_only=True,
+        ...                                      n_sample=900)
+    """
+    df = pd.merge(df_clean, df_spice, left_index=True, right_index=True)
+    print(df["type_of_area"].value_counts())
+    print("Total data points:", df.shape)
+
+    if know_station_only:
+        df = df[df["type_of_area"] != "unknown"]
+
+        if n_sample is not None:
+            n_indiv = int(n_sample / 3)
+            n_rural    = min(len(df[df["type_of_area"] == "rural"]),    n_indiv)
+            n_suburban = min(len(df[df["type_of_area"] == "suburban"]), n_indiv)
+            n_urban    = n_sample - n_rural - n_suburban
+            print(f"Sampling – urban: {n_urban}, suburban: {n_suburban}, rural: {n_rural}")
+            df = pd.concat([
+                df[df["type_of_area"] == "urban"].sample(n=n_urban,    random_state=42),
+                df[df["type_of_area"] == "suburban"].sample(n=n_suburban, random_state=42),
+                df[df["type_of_area"] == "rural"].sample(n=n_rural,    random_state=42),
+            ])
+
+    return df
+
 
 if __name__ == "__main__":
     print("This module defines the TOARProcessing class and helper functions for data cleaning and preprocessing. It is not meant to be run directly.")

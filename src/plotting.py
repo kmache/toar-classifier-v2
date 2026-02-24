@@ -1,11 +1,17 @@
 import os
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, confusion_matrix
+
+# Project root: one level up from this file's directory (src/)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_FIGURES_DIR = _PROJECT_ROOT / "figures"
 
 # ── global style ─────────────────────────────────────────────────────────────
 sns.set_style("whitegrid")
@@ -53,7 +59,8 @@ num_vars = [
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _savefig(fig_path: str) -> None:
     """Create parent directories and save the current figure."""
-    os.makedirs(os.path.dirname(fig_path) if os.path.dirname(fig_path) else ".", exist_ok=True)
+    fig_path = Path(fig_path)
+    fig_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(fig_path, dpi=400, bbox_inches="tight")
 
 
@@ -87,7 +94,7 @@ def plot_correlation(data, fig_name: str = "") -> None:
         ax=ax,
     )
     plt.title("Linear correlation heatmap")
-    fig_path = os.path.abspath(os.path.join("figures", fig_name + "correlation.jpg"))
+    fig_path = str(_FIGURES_DIR / (fig_name + "correlation.jpg"))
     _savefig(fig_path)
     plt.show()
 
@@ -107,7 +114,7 @@ def boxplot(df) -> None:
         fig.show()
 
 
-def cf_matrix_plot(y_true, y_pred, fig_name: str = "confusion_matrix") -> None:
+def cf_matrix_plot(y_true, y_pred, fig_name: str = "confusion_matrix", title: str = "Confusion Matrix") -> None:
     """Pretty-print and save a confusion matrix heatmap.
 
     Parameters
@@ -118,6 +125,8 @@ def cf_matrix_plot(y_true, y_pred, fig_name: str = "confusion_matrix") -> None:
         Predicted labels.
     fig_name : str
         Base file name (without extension) saved under ``figures/``.
+    title : str
+        Title of the confusion matrix plot.
     """
     print("Accuracy: {:.2f}%".format(accuracy_score(y_true, y_pred) * 100))
     cm = confusion_matrix(y_true, y_pred)
@@ -135,9 +144,9 @@ def cf_matrix_plot(y_true, y_pred, fig_name: str = "confusion_matrix") -> None:
     )
     plt.xlabel("Predicted classes")
     plt.ylabel("True classes")
-    plt.title("Confusion Matrix")
+    plt.title(title, fontdict=font_title)
 
-    fig_path = os.path.abspath(os.path.join("figures", fig_name + ".jpg"))
+    fig_path = str(_FIGURES_DIR / (fig_name + ".jpg"))
     _savefig(fig_path)
     plt.show()
 
@@ -184,7 +193,7 @@ def plot_count_kde(
             sns.boxplot(x=df[col], color="lightgreen")
             plt.title(f"{col} - Boxplot")
             plt.tight_layout()
-            fig_path = os.path.abspath(os.path.join("figures", f"{col}.jpg"))
+            fig_path = str(_FIGURES_DIR / f"{col}.jpg")
             _savefig(fig_path)
             plt.show()
         print("✅ Successfully plotted numeric features!")
@@ -199,7 +208,7 @@ def plot_count_kde(
             sns.countplot(x=col, data=df, palette="pastel")
             plt.title(f"{col} - Countplot")
             plt.xticks(rotation=45)
-            fig_path = os.path.abspath(os.path.join("figures", f"{col}.jpg"))
+            fig_path = str(_FIGURES_DIR / f"{col}.jpg")
             _savefig(fig_path)
             plt.show()
         print("✅ Successfully plotted categorical features!")
@@ -221,7 +230,7 @@ def plot_count_kde(
                     xytext=(0, 5),
                     textcoords="offset points",
                 )
-            fig_path = os.path.abspath(os.path.join("figures", f"value_counts_{target}.jpg"))
+            fig_path = str(_FIGURES_DIR / f"value_counts_{target}.jpg")
             _savefig(fig_path)
             plt.show()
             print(f"✅ Successfully plotted target variable '{target}'!")
@@ -231,34 +240,50 @@ def plot_count_kde(
 
 def plot_clusters(
     trained_model,
-    test_data,
-    y_pred,
+    df: pd.DataFrame,
+    y_pred: np.ndarray | None = None,
+    exclude_cols: list[str] | None = None,
     labels_map: dict = None,
     save_path: str = None,
 ) -> None:
     """Visualise cluster assignments in a 2-D PCA space.
 
-    A fresh 2-component PCA is always fitted on *test_data* for visualisation
-    so the axis labels can report the explained variance of each component.
+    A fresh 2-component PCA is always fitted on the numeric features of *df*
+    for visualisation so the axis labels can report the explained variance of
+    each component.
 
     Parameters
     ----------
-    trained_model : dict
-        Dictionary returned by ``train_clustering_model`` (keys: ``'model'``,
-        ``'pca'``, ``'use_pca'``).
-    test_data : array-like or pd.DataFrame
-        Feature matrix to project.
-    y_pred : array-like
-        Integer cluster label for each row of *test_data*.
+    trained_model : TOARClustering or similar
+        A fitted clustering model that exposes a ``predict(X)`` method.
+        Used to compute *y_pred* when it is not supplied, and to plot
+        centroids when the underlying model has ``cluster_centers_``.
+    df : pd.DataFrame
+        Feature DataFrame.  Non-predictor columns listed in *exclude_cols*
+        are dropped before PCA projection and prediction.
+    y_pred : array-like, optional
+        Integer cluster labels for each row of *df*.  If ``None``, labels
+        are computed as ``trained_model.predict(X)``.
+    exclude_cols : list[str], optional
+        Columns to drop from *df* before prediction / projection.
+        Defaults to ``['area_code', 'type_of_area', 'type_of_area_gmap']``.
     labels_map : dict, optional
         Mapping from cluster integer to human-readable string,
         e.g. ``{0: 'suburban', 1: 'rural', 2: 'urban'}``.
     save_path : str, optional
         File path to save the figure (uses ``_savefig``); skipped when ``None``.
     """
+    if exclude_cols is None:
+        exclude_cols = ["area_code", "type_of_area", "type_of_area_gmap"]
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    X = df[feature_cols]
+
+    if y_pred is None:
+        y_pred = trained_model.predict(X)
+
     # Always use a fresh 2-D PCA so we can report explained variance
     pca_2d = PCA(n_components=2)
-    data_2d = pca_2d.fit_transform(test_data)
+    data_2d = pca_2d.fit_transform(X)
     explained_variance = pca_2d.explained_variance_ratio_
 
     colors = ["darkblue", "purple", "darkorange", "green", "red", "cyan"]
@@ -272,8 +297,9 @@ def plot_clusters(
     )
 
     # Plot centroids if the model exposes them (KMeans)
-    if hasattr(trained_model["model"], "cluster_centers_"):
-        centers = trained_model["model"].cluster_centers_
+    _model = getattr(trained_model, "model_", trained_model)
+    if hasattr(_model, "cluster_centers_"):
+        centers = _model.cluster_centers_
         centers_2d = pca_2d.transform(centers)
         plt.scatter(
             centers_2d[:, 0], centers_2d[:, 1],
@@ -283,9 +309,7 @@ def plot_clusters(
 
     plt.xlabel(f"Principal Component 1 ({explained_variance[0]:.2%} variance)")
     plt.ylabel(f"Principal Component 2 ({explained_variance[1]:.2%} variance)")
-    plt.title("K-means Clustering: Rural, Urban, and Suburban Areas")
-
-    # Build legend from labels_map or fall back to cluster indices
+    plt.title("Clustering: Rural, Urban, and Suburban Areas")
     if labels_map:
         legend_elements = [
             plt.Line2D(
@@ -314,7 +338,7 @@ def plot_clusters(
     plt.tight_layout()
 
     if save_path:
-        _savefig(save_path)
+        _savefig(save_path) 
     plt.show()
 
 
@@ -352,64 +376,84 @@ def plot_feature_importance(trained_clf, model_name: str = "", save_plot: bool =
     plt.tight_layout()
 
     if save_plot:
-        fig_path = os.path.abspath(
-            os.path.join("figures", f"features_importances_{model_name}.jpg")
-        )
+        fig_path = str(_FIGURES_DIR / f"features_importances_{model_name}.jpg")
         _savefig(fig_path)
     plt.show()
 
 
 def plot_data_distribution_bar(
+    data_fe,
     df_train,
     df_test,
-    df_val=None,
     target: str = "type_of_area",
+    categories: list = None,
     save_plot: bool = True,
 ) -> None:
-    """Grouped bar chart showing class counts in each data split.
+    """Grouped bar chart showing class counts in full, train, and test data.
 
     Parameters
     ----------
+    data_fe : pd.DataFrame
+        Full (feature-engineered) dataset.
     df_train : pd.DataFrame
         Training set (must contain *target* column).
     df_test : pd.DataFrame
         Test set.
-    df_val : pd.DataFrame, optional
-        Validation / unlabeled set. Skipped when ``None``.
     target : str
         Column name for the class labels.
+    categories : list, optional
+        Ordered list of category labels for the x-axis. If ``None``,
+        defaults to ``['unknown', 'urban', 'suburban', 'rural']``.
     save_plot : bool
         Save to ``figures/data_distribution_bar.jpg`` when ``True``.
     """
-    import pandas as pd
+    if categories is None:
+        categories = ["unknown", "urban", "suburban", "rural"]
 
-    splits: dict = {"Train": df_train, "Test": df_test}
-    if df_val is not None:
-        splits["Val / Unlabeled"] = df_val
+    full_counts = data_fe[target].value_counts().reindex(categories)
+    counts_train = df_train[target].value_counts().reindex(categories)
+    counts_test = df_test[target].value_counts().reindex(categories)
 
-    counts = {}
-    for split_name, split_df in splits.items():
-        if target in split_df.columns:
-            counts[split_name] = split_df[target].value_counts()
-        else:
-            counts[split_name] = pd.Series({"all": len(split_df)})
+    plt.figure(figsize=(12, 6), facecolor="white")
 
-    count_df = pd.DataFrame(counts).fillna(0).astype(int)
+    bar_width = 0.3
+    x_pos = np.arange(len(categories))
 
-    ax = count_df.plot(kind="bar", figsize=(10, 6), rot=0, colormap="tab10")
-    plt.title("Data Distribution per Split")
-    plt.xlabel("Class")
-    plt.ylabel("Count")
-    plt.legend(title="Split")
+    bars1 = plt.bar(x_pos - bar_width, full_counts.values, width=bar_width, label="Full Data")
+    bars2 = plt.bar(x_pos, counts_train.values, width=bar_width, label="Training Data", alpha=0.85, color="coral")
+    bars3 = plt.bar(x_pos + bar_width, counts_test.values, width=bar_width, label="Test Data", alpha=0.7, color="green")
 
-    # annotate bar heights
-    for container in ax.containers:
-        ax.bar_label(container, label_type="edge", padding=3, fontsize=10)
+    plt.xlabel("Area Categories")
+    plt.ylabel("Counts")
+    plt.title(f"Distribution of {target} in datasets")
+    plt.xticks(x_pos, categories)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.gca().set_facecolor("white")
+
+    # add count labels on top of each bar
+    def _add_value_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                plt.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + 5,
+                    f"{int(height)}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+    _add_value_labels(bars1)
+    _add_value_labels(bars2)
+    _add_value_labels(bars3)
 
     plt.tight_layout()
     if save_plot:
-        fig_path = os.path.abspath(os.path.join("figures", "data_distribution_bar.jpg"))
-        _savefig(fig_path)
+        fig_path = str(_FIGURES_DIR / "data_distribution_bar.jpg")
+        _FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+        plt.savefig(fig_path, dpi=600, transparent=False, facecolor="white", bbox_inches="tight")
     plt.show()
 
 
@@ -476,7 +520,10 @@ def plot_data_distribution_map(
     plt.tight_layout()
 
     if save_plot:
-        fig_path = os.path.abspath(os.path.join("figures", "data_distribution_map.jpg"))
+        fig_path = str(_FIGURES_DIR / "data_distribution_map.jpg")
         _savefig(fig_path)
     plt.show()
 
+if __name__ == "__main__":
+    print("This module contains plotting functions for EDA and model evaluation. "
+          "Import and call the desired functions from your notebook or script.")

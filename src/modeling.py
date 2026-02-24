@@ -39,6 +39,7 @@ from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 
@@ -145,6 +146,7 @@ class TOARClustering:
         return GaussianMixture(
             n_components=self.num_clusters,
             random_state=42,
+            n_init=self.kwargs.get("n_init", 1),
             covariance_type=self.kwargs.get("covariance_type", "full"),
             max_iter=self.kwargs.get("max_iter", 100),
         )
@@ -185,7 +187,7 @@ class TOARClustering:
             X_transformed = self.pca_.fit_transform(X)
             print(f"Shape after PCA: {X_transformed.shape}")
         else:
-            X_transformed = np.asarray(X)
+            X_transformed = X
 
         self.model_ = self._build_model()
         self.model_.fit(X_transformed)
@@ -331,7 +333,7 @@ class TOARClassifier:
     _DEFAULT_RF: dict = dict(n_estimators=500, random_state=42)
 
     _DEFAULT_CATBOOST: dict = dict(
-        n_estimators=500,
+        iterations=500,          # Use CatBoost-native name; synonym n_estimators must not coexist
         learning_rate=0.03986794927756705,
         depth=9,
         l2_leaf_reg=6,
@@ -348,6 +350,7 @@ class TOARClassifier:
         eval_metric="mlogloss",
         random_state=42,
         verbosity=0,
+        enable_categorical=True,
     )
 
     def __init__(
@@ -371,6 +374,11 @@ class TOARClassifier:
 
         self.estimators_: dict[str, object] = {}
         self.is_fitted_:  bool              = False
+        # Label encoding – maps string targets to ints for models like XGBoost
+        self._label_encoder: LabelEncoder | None = None
+        # Categorical state – populated during fit()
+        self._cat_cols: list[str]             = []
+        self._rf_ohe:   OneHotEncoder | None  = None
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -410,11 +418,41 @@ class TOARClassifier:
             f"{type(clf).__name__} does not expose known feature-name attributes."
         )
 
-    def _predict_one(self, clf, X: pd.DataFrame) -> np.ndarray:
-        features = self._get_features(clf)
-        return clf.predict(X[features]).reshape(-1)
+    def _prepare_X(self, name: str, X: pd.DataFrame) -> pd.DataFrame:
+        """Return a model-specific copy of X with categoricals handled.
 
-    def _predict_proba_one(self, clf, X: pd.DataFrame) -> np.ndarray:
+        Strategy per model
+        ------------------
+        rf       : OHE (sklearn has no native categorical support)
+        catboost : pass strings as-is; cat_features passed at fit()-time
+        lgbm     : cast to pd.Categorical (auto-detected by LightGBM)
+        xgb      : cast to pd.Categorical (requires enable_categorical=True)
+        """
+        cat_cols = [c for c in self._cat_cols if c in X.columns]
+        if not cat_cols:
+            return X
+        X = X.copy()
+        if name == "rf":
+            ohe_arr  = self._rf_ohe.transform(X[cat_cols])
+            ohe_cols = self._rf_ohe.get_feature_names_out(cat_cols).tolist()
+            ohe_df   = pd.DataFrame(ohe_arr, columns=ohe_cols, index=X.index)
+            X = pd.concat([X.drop(columns=cat_cols), ohe_df], axis=1)
+        elif name in ("lgbm", "xgb"):
+            for col in cat_cols:
+                X[col] = X[col].astype("category")
+        # catboost: strings are native – no transformation needed
+        return X
+
+    def _predict_one(self, name: str, clf, X: pd.DataFrame) -> np.ndarray:
+        X = self._prepare_X(name, X)
+        features = self._get_features(clf)
+        preds = clf.predict(X[features]).reshape(-1)
+        if self._label_encoder is not None:
+            preds = self._label_encoder.inverse_transform(preds.astype(int))
+        return preds
+
+    def _predict_proba_one(self, name: str, clf, X: pd.DataFrame) -> np.ndarray:
+        X = self._prepare_X(name, X)
         features = self._get_features(clf)
         return clf.predict_proba(X[features])
 
@@ -450,13 +488,50 @@ class TOARClassifier:
         """
         estimators = self._build_estimators()
 
-        if self.use_smote:
-            smote = SMOTE(random_state=42)
-            X_train, y_train = smote.fit_resample(X_train, y_train)
-            print("✅ SMOTE applied to balance classes!")
+        # ── Encode string labels to integers ──────────────────────────────────
+        y_train = np.asarray(y_train).ravel()
+        if y_train.dtype.kind in ("U", "S", "O"):          # string / object
+            self._label_encoder = LabelEncoder()
+            y_train = self._label_encoder.fit_transform(y_train)
+        else:
+            self._label_encoder = None
 
+        # ── Detect categorical columns ────────────────────────────────────────
+        self._cat_cols = (
+            X_train.select_dtypes(include=["object", "category"])
+            .columns.tolist()
+        )
+
+        # ── Fit RF OHE encoder once ───────────────────────────────────────────
+        if self._cat_cols and "rf" in estimators:
+            self._rf_ohe = OneHotEncoder(
+                handle_unknown="ignore",
+                sparse_output=False,
+            )
+            self._rf_ohe.fit(X_train[self._cat_cols])
+
+        if self.use_smote:
+            if self._cat_cols:
+                warnings.warn(
+                    "SMOTE requires fully numeric data but categorical columns "
+                    f"were found: {self._cat_cols}. SMOTE skipped. "
+                    "Encode categoricals in TOARFeature before enabling SMOTE.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                smote = SMOTE(random_state=42)
+                X_train, y_train = smote.fit_resample(X_train, y_train)
+                print("✅ SMOTE applied to balance classes!")
+
+        # ── Train each model with its own categorical strategy ────────────────
         for name, clf in estimators.items():
-            clf.fit(X_train, y_train)
+            X_fit = self._prepare_X(name, X_train)
+            if name == "catboost" and self._cat_cols:
+                # CatBoost handles raw strings natively via cat_features
+                clf.fit(X_fit, y_train, cat_features=self._cat_cols)
+            else:
+                clf.fit(X_fit, y_train)
             print(f"✅ {name.upper()} trained successfully!")
             self.estimators_[name] = clf
 
@@ -491,10 +566,10 @@ class TOARClassifier:
         self._check_fitted()
 
         if model is not None:
-            return self._predict_one(self.estimators_[model], X)
+            return self._predict_one(model, self.estimators_[model], X)
 
         preds = {
-            name: self._predict_one(clf, X)
+            name: self._predict_one(name, clf, X)
             for name, clf in self.estimators_.items()
         }
         # Majority-vote ensemble
@@ -527,9 +602,9 @@ class TOARClassifier:
         self._check_fitted()
 
         if model is not None:
-            return self._predict_proba_one(self.estimators_[model], X)
+            return self._predict_proba_one(model, self.estimators_[model], X)
         return {
-            name: self._predict_proba_one(clf, X)
+            name: self._predict_proba_one(name, clf, X)
             for name, clf in self.estimators_.items()
         }
 
@@ -615,6 +690,25 @@ class TOARClassifier:
             joblib.dump(clf, file_path)
             print(f"✅ {name.upper()} saved to: {file_path.resolve()}")
             saved.append(file_path.resolve())
+
+        # Persist the label encoder so loaded models can decode predictions
+        if self._label_encoder is not None:
+            le_path = save_dir / "label_encoder.pkl"
+            joblib.dump(self._label_encoder, le_path)
+            print(f"✅ LabelEncoder saved to: {le_path.resolve()}")
+            saved.append(le_path.resolve())
+
+        # Persist classifier metadata needed for inference
+        meta = {
+            "_cat_cols": self._cat_cols,
+            "_rf_ohe": self._rf_ohe,
+            "_label_encoder": self._label_encoder,
+        }
+        meta_path = save_dir / "classifier_meta.pkl"
+        joblib.dump(meta, meta_path)
+        print(f"✅ Classifier metadata saved to: {meta_path.resolve()}")
+        saved.append(meta_path.resolve())
+
         return saved
 
     @classmethod
@@ -645,6 +739,12 @@ class TOARClassifier:
         instance = cls(models=[model], use_smote=False)
         instance.estimators_[model] = clf
         instance.is_fitted_ = True
+
+        # Try to load a label encoder saved alongside the model
+        le_path = file_path.parent / "label_encoder.pkl"
+        if le_path.exists():
+            instance._label_encoder = joblib.load(le_path)
+
         print(f"✅ {model.upper()} loaded from: {file_path.resolve()}")
         return instance
 

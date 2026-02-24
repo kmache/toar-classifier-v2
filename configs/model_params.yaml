@@ -1,0 +1,60 @@
+# model_params.yaml
+# Hyperparameters for each classifier used in TOARClassifier.
+# All values are passed directly to TOARClassifier via the *_params arguments.
+
+rf_params:
+  n_estimators: 500          # 300–500 is usually the sweet spot
+  criterion: gini
+  class_weight: balanced     # Automatically handles class imbalance
+  max_depth: 12              # Prevent trees from going infinitely deep
+  min_samples_split: 5       # Require 5 samples to split a node
+  min_samples_leaf: 2        # Require 2 samples in every leaf
+  max_features: sqrt         # Standard for classification
+  bootstrap: true
+  n_jobs: -1
+  random_state: 42
+
+catboost_params:
+  iterations: 1000           # High number, but rely on early stopping
+  learning_rate: 0.05        # Lower learning rate for small data
+  depth: 5                   # Keep shallow (4–6 max) to prevent overfitting
+  loss_function: MultiClass  # Essential for 3-class
+  eval_metric: TotalF1       # Macro F1 is better than Accuracy for imbalance
+  auto_class_weights: Balanced  # Automatically weights classes
+  l2_leaf_reg: 5             # Regularization (increase to 10 if overfitting)
+  early_stopping_rounds: 50
+  random_seed: 42
+  verbose: 100
+
+lgbm_params:
+  objective: multiclass
+  num_class: 3
+  learning_rate: 0.05
+  n_estimators: 1000
+  class_weight: balanced     # Automatically penalizes the majority class
+  max_depth: 5               # Limit depth
+  num_leaves: 20             # Must be < 2^max_depth (i.e. < 32)
+  min_child_samples: 5       # min_data_in_leaf alias; 5 avoids "no further splits" on small datasets
+  subsample: 0.8             # Row sampling (bootstrap)
+  colsample_bytree: 0.8      # Feature sampling
+  reg_alpha: 0.1             # L1 regularization
+  reg_lambda: 1.0            # L2 regularization
+  random_state: 42
+  n_jobs: -1
+
+xgb_params:
+  objective: "multi:softprob"  # Outputs probabilities for each class
+  num_class: 3
+  learning_rate: 0.05
+  n_estimators: 1000
+  max_depth: 4               # Keep shallower than LightGBM (4–5)
+  min_child_weight: 3        # Stop splitting if node is too small
+  subsample: 0.8
+  colsample_bytree: 0.8
+  gamma: 0.2                 # Minimum loss reduction required to split
+  alpha: 0.1                 # L1
+  lambda: 1.0                # L2
+  tree_method: hist          # Use histogram method (much faster)
+  enable_categorical: true   # Required for pd.Categorical dtype support
+  random_state: 42
+  n_jobs: -1
