@@ -163,8 +163,10 @@ def _cf_matrix(y_true, y_pred, fig_name: str = "_") -> None:
     plt.xlabel("Predicted classes")
     plt.ylabel("True classes")
     plt.title("Confusion Matrix")
-    os.makedirs("figures", exist_ok=True)
-    fig_path = os.path.abspath(os.path.join("figures", fig_name + ".jpg"))
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    figures_dir = os.path.join(project_root, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+    fig_path = os.path.join(figures_dir, fig_name + ".jpg")
     plt.savefig(fig_path, dpi=400, bbox_inches="tight")
     plt.show()
 
@@ -376,9 +378,11 @@ def statistics_evaluation(df_spice: pd.DataFrame, clf, spice: str, percentile:st
     plt.ylabel(f"{percentile} of {spice}")
     plt.xticks([0.25, 0.75, 1.25], ["urban", "suburban", "rural"])
     plt.grid(True, alpha=0.3)
-    os.makedirs("figures", exist_ok=True)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    figures_dir = os.path.join(project_root, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
     plt.savefig(
-        os.path.join("figures", f"box_{spice}.jpg"), dpi=400, bbox_inches="tight"
+        os.path.join(figures_dir, f"box_{spice}.jpg"), dpi=400, bbox_inches="tight"
     )
     plt.show()
 

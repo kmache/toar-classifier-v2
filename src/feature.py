@@ -70,6 +70,8 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         cap_outliers: If True, cap numeric features to IQR bounds at fit time.
         handle_skewness: If True, apply Yeo-Johnson to highly skewed features
                          (|skewness| > 1) at fit time.
+        verbose: If True (default), print progress messages during
+                 fit / transform. Set to False to suppress all output.
 
     Attributes:
         _scaler: Fitted scaler instance (or None).
@@ -104,6 +106,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         convert_vars: list[str] | None = None,
         cap_outliers: bool = False,
         handle_skewness: bool = True,
+        verbose: bool = True,
     ) -> None:
         self.selected_columns = selected_columns
         self.scaling = scaling
@@ -115,6 +118,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         self.convert_vars = convert_vars
         self.cap_outliers = cap_outliers
         self.handle_skewness = handle_skewness
+        self.verbose = verbose
 
         # Lazy import: avoids module-level cross-import that breaks %autoreload
         from src.processing import NUM_VARS, CAT_VARS
@@ -133,6 +137,11 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         self._numeric_cols: list[str] = []
         self._cols_to_scale: list[str] = []
         self._is_fitted: bool = False
+
+    def _log(self, msg: str) -> None:
+        """Print *msg* only when verbose mode is enabled."""
+        if getattr(self, "verbose", True):
+            print(msg)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -255,7 +264,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             else:
                 raise ValueError("cat_encoder must be 'ohe' or 'le'.")
         elif not self.encode_categories:
-            print("⏭️  Categorical encoding skipped (encode_categories=False).")
+            self._log("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Refresh numeric cols after encoding (OHE may add columns)
         self._numeric_cols = self._resolve_numeric_cols(df)
@@ -283,10 +292,10 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             self._scaler = self._build_scaler()
             self._scaler.fit(df[self._cols_to_scale])
         elif not self.scale_features:
-            print("⏭️  Feature scaling skipped (scale_features=False).")
+            self._log("⏭️  Feature scaling skipped (scale_features=False).")
 
         self._is_fitted = True
-        print("✅ TOARFeature fitted successfully!")
+        self._log("✅ TOARFeature fitted successfully!")
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -341,7 +350,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                         )
                         df[var] = le.transform(df[var])
         elif not self.encode_categories:
-            print("⏭️  Categorical encoding skipped (encode_categories=False).")
+            self._log("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Step 5: apply PowerTransformer to skewed columns
         if self._power_transformer is not None and self._skewed_cols:
@@ -355,9 +364,9 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             if present_scale_cols:
                 df[present_scale_cols] = self._scaler.transform(df[present_scale_cols])
         elif not self.scale_features:
-            print("⏭️  Feature scaling skipped (scale_features=False).")
+            self._log("⏭️  Feature scaling skipped (scale_features=False).")
 
-        print(f"✅ Feature engineering complete! Shape: {df.shape}")
+        self._log(f"✅ Feature engineering complete! Shape: {df.shape}")
         return df
 
     def fit_transform(self, X: pd.DataFrame, y=None, **fit_params) -> pd.DataFrame:
@@ -393,24 +402,24 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 hi = float(q3[col] + 1.5 * iqr[col])
                 self._iqr_bounds[col] = (lo, hi)
                 df[col] = df[col].clip(lower=lo, upper=hi)
-            print(f"✅ Outlier capping applied to {len(self._iqr_bounds)} columns!")
+            self._log(f"✅ Outlier capping applied to {len(self._iqr_bounds)} columns!")
 
         # Step 3: fit + apply encoders
         if self.encode_categories and encode_vars and self.cat_encoder:
             if self.cat_encoder == "ohe":
                 df = pd.get_dummies(df, columns=encode_vars, drop_first=True, dtype=float)
                 self._ohe_columns = df.columns.tolist()
-                print(f"✅ One-hot encoded {len(encode_vars)} variables: {encode_vars}")
+                self._log(f"✅ One-hot encoded {len(encode_vars)} variables: {encode_vars}")
             elif self.cat_encoder == "le":
                 for var in encode_vars:
                     le = LabelEncoder()
                     df[var] = le.fit_transform(df[var].astype(str))
                     self._label_encoders[var] = le
-                print(f"✅ Label encoded {len(encode_vars)} variables: {encode_vars}")
+                self._log(f"✅ Label encoded {len(encode_vars)} variables: {encode_vars}")
             else:
                 raise ValueError("cat_encoder must be 'ohe' or 'le'.")
         elif not self.encode_categories:
-            print("⏭️  Categorical encoding skipped (encode_categories=False).")
+            self._log("⏭️  Categorical encoding skipped (encode_categories=False).")
 
         # Refresh numeric cols after encoding
         self._numeric_cols = self._resolve_numeric_cols(df)
@@ -422,7 +431,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
             if self._skewed_cols:
                 self._power_transformer = PowerTransformer(method="yeo-johnson")
                 df[self._skewed_cols] = self._power_transformer.fit_transform(df[self._skewed_cols])
-                print(f"✅ Yeo-Johnson applied to {len(self._skewed_cols)} skewed columns!")
+                self._log(f"✅ Yeo-Johnson applied to {len(self._skewed_cols)} skewed columns!")
 
         # Step 6: fit + apply scaler
         if self.scale_features and self.scaling:
@@ -434,12 +443,12 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 raise ValueError(f"scale_only must be 'numeric' or 'all', got '{self.scale_only}'.")
             self._scaler = self._build_scaler()
             df[self._cols_to_scale] = self._scaler.fit_transform(df[self._cols_to_scale])
-            print(f"✅ {self.scaling} scaling applied to {self.scale_only} features!")
+            self._log(f"✅ {self.scaling} scaling applied to {self.scale_only} features!")
         elif not self.scale_features:
-            print("⏭️  Feature scaling skipped (scale_features=False).")
+            self._log("⏭️  Feature scaling skipped (scale_features=False).")
 
         self._is_fitted = True
-        print(f"✅ Feature engineering complete! Shape: {df.shape}")
+        self._log(f"✅ Feature engineering complete! Shape: {df.shape}")
         return df
 
     # ------------------------------------------------------------------
@@ -465,7 +474,7 @@ class TOARFeature(BaseEstimator, TransformerMixin):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self, path)
-        print(f"✅ Feature engineer saved to '{path}'")
+        self._log(f"✅ Feature engineer saved to '{path}'")
 
     @classmethod
     def load(cls, path: str | Path = "models/feature_engineer.pkl") -> "TOARFeature":
@@ -490,7 +499,9 @@ class TOARFeature(BaseEstimator, TransformerMixin):
                 f"No feature engineer found at '{path}'. Train and save one first."
             )
         fe = joblib.load(path)
-        print(f"✅ Feature engineer loaded from '{path}'")
+        if not hasattr(fe, "verbose"):
+            fe.verbose = True
+        fe._log(f"✅ Feature engineer loaded from '{path}'")
         return fe
 
 if __name__ == "__main__":

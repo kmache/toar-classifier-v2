@@ -265,6 +265,8 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                     for tree-based models (XGBoost, LightGBM, CatBoost) that
                     handle NaN values natively.
         display_duplicate: If True, prints duplicate rows found during fit.
+        verbose: If True (default), print progress messages during
+                 fit / transform. Set to False to suppress all output.
 
     Attributes:
         _cat_imputer: Fitted SimpleImputer for categorical columns.
@@ -288,12 +290,14 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         num_imputer: str | None = None,
         impute_nan: bool = True,
         display_duplicate: bool = False,
+        verbose: bool = True,
     ) -> None:
         self.nan_subset = nan_subset
         self.filter_nan = filter_nan
         self.num_imputer = num_imputer
         self.impute_nan = impute_nan
         self.display_duplicate = display_duplicate
+        self.verbose = verbose
 
         # Snapshot column schemas so they survive pickling
         self._num_vars: list[str] = list(NUM_VARS)
@@ -303,6 +307,11 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         self._cat_imputer: SimpleImputer | None = None
         self._num_simple_imputer: SimpleImputer | None = None
         self._is_fitted: bool = False
+
+    def _log(self, msg: str) -> None:
+        """Print *msg* only when verbose mode is enabled."""
+        if getattr(self, "verbose", True):
+            print(msg)
 
     # Bind module-level helpers so they survive pickling / %autoreload
     _timezone_mapping = staticmethod(timezone_mapping)
@@ -320,41 +329,41 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         # Step 1 & 2: set index and drop duplicates
         if "lat" in dataset.columns and "lon" in dataset.columns:
             dataset = dataset.set_index(["lat", "lon"])
-            print("✅ Set (lat, lon) as index!")
+            self._log("✅ Set (lat, lon) as index!")
 
         if self.display_duplicate and is_fit:
             duplicates = dataset[dataset.index.duplicated(keep=False)]
             if not duplicates.empty:
-                print("Duplicate data points:")
-                print(duplicates)
+                self._log("Duplicate data points:")
+                self._log(str(duplicates))
 
         n_before = dataset.shape[0]
         dataset = dataset[~dataset.index.duplicated(keep="first")]
-        print(f"✅ {n_before - dataset.shape[0]} duplicate rows removed!")
+        self._log(f"✅ {n_before - dataset.shape[0]} duplicate rows removed!")
 
         # Steps 3-5: structural encodings
         dataset = self._timezone_mapping(dataset)
         dataset = self._parse_vars(dataset)
         dataset = self._group_landcover_cat(dataset)
-        print("✅ Parsed timezone and categorical variables!")
+        self._log("✅ Parsed timezone and categorical variables!")
 
         # Step 6: replace sentinel missing-value codes
         dataset.replace(-999.0, np.nan, inplace=True)
         dataset.replace(-9999.0, np.nan, inplace=True)
         if "altitude" in dataset.columns:
             dataset["altitude"].replace(9999.0, np.nan, inplace=True)
-        print("✅ Sentinel values (-999, -9999, 9999) replaced with NaN!")
+        self._log("✅ Sentinel values (-999, -9999, 9999) replaced with NaN!")
 
         # Step 7: filter rows with too many NaN in key columns
         present_nan_subset = [c for c in self.nan_subset if c in dataset.columns]
-        print(f"Initial data size: {init_shape}")
+        self._log(f"Initial data size: {init_shape}")
         n_before = dataset.shape[0]
         if self.filter_nan == "all":
             dataset = dataset[~dataset[present_nan_subset].isna().all(axis=1)]
         else:
             dataset = dataset[~dataset[present_nan_subset].isna().any(axis=1)]
         n_dropped_nan = n_before - dataset.shape[0]
-        print(f"✅ NaN filter (filter_nan={self.filter_nan!r}): {n_dropped_nan} rows dropped ({dataset.shape[0]} remaining).")
+        self._log(f"✅ NaN filter (filter_nan={self.filter_nan!r}): {n_dropped_nan} rows dropped ({dataset.shape[0]} remaining).")
 
         # Step 8: cross-fill altitude <-> topography srtm
         if "altitude" in dataset.columns and "mean_topography_srtm_alt_90m_year1994" in dataset.columns:
@@ -401,10 +410,10 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                 self._cat_imputer = SimpleImputer(strategy="most_frequent")
                 self._cat_imputer.fit(dataset[cat_cols_to_impute])
         else:
-            print("⏭️  Imputation skipped (impute_nan=False).")
+            self._log("⏭️  Imputation skipped (impute_nan=False).")
 
         self._is_fitted = True
-        print("✅ TOARProcessing fitted successfully!")
+        self._log("✅ TOARProcessing fitted successfully!")
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -441,30 +450,30 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                 dataset = self._iterative_imputer(
                     dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
                 )
-            print("✅ Numeric missing values imputed!")
+            self._log("✅ Numeric missing values imputed!")
 
             # Step 10: apply categorical imputation
             if cat_cols_to_impute and self._cat_imputer is not None:
                 dataset[cat_cols_to_impute] = self._cat_imputer.transform(
                     dataset[cat_cols_to_impute]
                 )
-            print("✅ Categorical missing values imputed!")
+            self._log("✅ Categorical missing values imputed!")
         else:
-            print("⏭️  Imputation skipped (impute_nan=False).")
+            self._log("⏭️  Imputation skipped (impute_nan=False).")
 
         # Step 11: remove rows with negative road distance (data quality)
         if "distance_to_major_road_year2020" in dataset.columns:
             n_before = dataset.shape[0]
             dataset = dataset[dataset["distance_to_major_road_year2020"] >= 0]
             n_dropped_road = n_before - dataset.shape[0]
-            print(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
+            self._log(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
 
         # Step 12: cast categorical columns to str
         for col in cat_cols:
             dataset[col] = dataset[col].astype(str)
-        print("✅ Categorical columns cast to str dtype!")
+        self._log("✅ Categorical columns cast to str dtype!")
 
-        print(f"✅ Preprocessing complete! Shape: {dataset.shape}")
+        self._log(f"✅ Preprocessing complete! Shape: {dataset.shape}")
         return dataset
 
     def fit_transform(self, X: pd.DataFrame, y=None, **fit_params) -> pd.DataFrame:
@@ -497,7 +506,7 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                 dataset = self._iterative_imputer(
                     dataset, subset_to_impute=present_num_vars, estimator=self.num_imputer
                 )
-            print("✅ Numeric missing values imputed!")
+            self._log("✅ Numeric missing values imputed!")
 
             # Categorical imputation (fit + transform)
             if cat_cols_to_impute:
@@ -505,24 +514,24 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
                 dataset[cat_cols_to_impute] = self._cat_imputer.fit_transform(
                     dataset[cat_cols_to_impute]
                 )
-            print("✅ Categorical missing values imputed!")
+            self._log("✅ Categorical missing values imputed!")
         else:
-            print("⏭️  Imputation skipped (impute_nan=False).")
+            self._log("⏭️  Imputation skipped (impute_nan=False).")
 
         # Road distance quality filter
         if "distance_to_major_road_year2020" in dataset.columns:
             n_before = dataset.shape[0]
             dataset = dataset[dataset["distance_to_major_road_year2020"] >= 0]
             n_dropped_road = n_before - dataset.shape[0]
-            print(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
+            self._log(f"✅ Negative road distance filter: {n_dropped_road} rows dropped ({dataset.shape[0]} remaining).")
 
         # Cast categoricals to str
         for col in cat_cols:
             dataset[col] = dataset[col].astype(str)
-        print("✅ Categorical columns cast to str dtype!")
+        self._log("✅ Categorical columns cast to str dtype!")
 
         self._is_fitted = True
-        print(f"✅ Preprocessing complete! Shape: {dataset.shape}")
+        self._log(f"✅ Preprocessing complete! Shape: {dataset.shape}")
         return dataset
 
     # ------------------------------------------------------------------
@@ -553,7 +562,7 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self, path)
-        print(f"✅ Processor saved to '{path}'")
+        self._log(f"✅ Processor saved to '{path}'")
 
     @classmethod
     def load(cls, path: str | Path = "models/processor.pkl") -> "TOARProcessing":
@@ -579,7 +588,9 @@ class TOARProcessing(BaseEstimator, TransformerMixin):
         if not path.exists():
             raise FileNotFoundError(f"No processor found at '{path}'. Train and save one first.")
         processor = joblib.load(path)
-        print(f"✅ Processor loaded from '{path}'")
+        if not hasattr(processor, "verbose"):
+            processor.verbose = True
+        processor._log(f"✅ Processor loaded from '{path}'")
         return processor
 
 

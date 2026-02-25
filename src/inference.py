@@ -19,8 +19,11 @@ Input formats accepted by ``predict()``
 - ``pd.DataFrame``        – One row per station, with raw metadata columns.
 - ``dict``                – Single station as a flat key/value dict.
 - ``list[dict]``          – Multiple stations, each as a flat dict.
-- ``str``                 – Single TOAR station code (fetched from API).
+- ``str``                 – Single TOAR station code (fetched from API),
+                            **or** a path to a ``.json`` file containing
+                            station record(s).
 - ``list[str]``           – Multiple TOAR station codes (fetched from API).
+- ``str`` / ``Path``      – Path to a ``.json`` file (dict or list of dicts).
 
 Output
 ------
@@ -34,6 +37,7 @@ When *best_model* is set, only ``pred_<best_model>`` is returned instead of
 all per-model columns (plus the ``voting`` column is omitted).
 """
 
+import json
 import sys
 import os
 import warnings
@@ -97,6 +101,10 @@ class TOARInference:
     output_format : str
         ``"dataframe"`` (default) – return a ``pd.DataFrame``.
         ``"dicts"``               – return a ``list[dict]``.
+    verbose : bool
+        If True (default), print progress messages during loading and
+        prediction. Set to False to suppress all output (also propagated
+        to the loaded processor and feature engineer).
 
     Attributes
     ----------
@@ -113,12 +121,14 @@ class TOARInference:
         models_dir: str | Path = "models",
         best_model: str | None = None,
         output_format: str = "dataframe",
+        verbose: bool = True,
     ) -> None:
         if output_format not in ("dataframe", "dicts"):
             raise ValueError("output_format must be 'dataframe' or 'dicts'.")
         self.models_dir = Path(models_dir)
         self.best_model = best_model
         self.output_format = output_format
+        self.verbose = verbose
 
         # Populated by _load_artifacts
         self.models_: dict[str, object] = {}
@@ -131,6 +141,11 @@ class TOARInference:
         self._label_encoder = None
 
         self._load_artifacts()
+
+    def _log(self, msg: str) -> None:
+        """Print *msg* only when verbose mode is enabled."""
+        if self.verbose:
+            print(msg)
 
     # ------------------------------------------------------------------
     # Artifact loading
@@ -155,6 +170,7 @@ class TOARInference:
                 "Train and save the processor first."
             )
         self.processor_ = TOARProcessing.load(processor_path)
+        self.processor_.verbose = self.verbose
 
         # -- 2. Feature engineer ------------------------------------------
         fe_path = models_dir / "feature_engineer.pkl"
@@ -164,6 +180,7 @@ class TOARInference:
                 "Train and save the feature engineer first."
             )
         self.feature_engineer_ = TOARFeature.load(fe_path)
+        self.feature_engineer_.verbose = self.verbose
 
         # -- 3. Classifier models -----------------------------------------
         for name, filename in _CLASSIFIER_FILES.items():
@@ -171,7 +188,7 @@ class TOARInference:
             if path.exists():
                 clf = joblib.load(path)
                 self.models_[name] = clf
-                print(f"✅ {name.upper()} loaded from: {path.resolve()}")
+                self._log(f"✅ {name.upper()} loaded from: {path.resolve()}")
 
         if not self.models_:
             raise FileNotFoundError(
@@ -186,7 +203,7 @@ class TOARInference:
             self._cat_cols = meta.get("_cat_cols", [])
             self._rf_ohe = meta.get("_rf_ohe", None)
             self._label_encoder = meta.get("_label_encoder", None)
-            print(f"✅ Classifier metadata loaded from: {meta_path.resolve()}")
+            self._log(f"✅ Classifier metadata loaded from: {meta_path.resolve()}")
 
         # Validate best_model is among loaded models (or 'voting')
         if self.best_model is not None:
@@ -207,6 +224,17 @@ class TOARInference:
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Convert any supported input type to a raw DataFrame.
 
+        Supported inputs
+        ----------------
+        - ``pd.DataFrame`` – raw station metadata.
+        - ``dict`` / ``list[dict]`` – station record(s).
+        - ``str`` – a single station code **or** a path to a JSON file.
+        - ``list[str]`` – multiple station codes.
+
+        When station codes are provided, the data is fetched from the
+        TOAR-II API.  Codes that cannot be fetched (HTTP error, missing
+        data) are reported to the user and excluded from the result.
+
         Returns
         -------
         raw_df : pd.DataFrame
@@ -216,11 +244,32 @@ class TOARInference:
             (``lat``, ``lon``, ``area_code``, ``type_of_area`` if present).
             Used to reconstruct the output after prediction.
         """
+        # -- JSON file path → load from disk ----------------------------
+        if isinstance(data, (str, Path)):
+            path = Path(data)
+            if path.suffix == ".json" and path.is_file():
+                with open(path) as f:
+                    payload = json.load(f)
+                # Accept both a single dict and a list of dicts
+                if isinstance(payload, dict):
+                    data = pd.DataFrame([payload])
+                elif isinstance(payload, list):
+                    data = pd.DataFrame(payload)
+                else:
+                    raise ValueError(
+                        f"JSON file must contain a dict or list of dicts, "
+                        f"got {type(payload).__name__}."
+                    )
+
         # -- station code(s) → fetch from API ---------------------------
         if isinstance(data, str):
-            data = get_data_from_station_codes([data])
+            requested_codes = [data]
+            data = get_data_from_station_codes(requested_codes)
+            self._report_skipped_codes(requested_codes, data)
         elif isinstance(data, list) and data and isinstance(data[0], str):
-            data = get_data_from_station_codes(data)
+            requested_codes = list(data)
+            data = get_data_from_station_codes(requested_codes)
+            self._report_skipped_codes(requested_codes, data)
 
         # -- dict → DataFrame -------------------------------------------
         if isinstance(data, dict):
@@ -231,8 +280,14 @@ class TOARInference:
         if not isinstance(data, pd.DataFrame):
             raise TypeError(
                 "predict() accepts: pd.DataFrame, dict, list[dict], "
-                "str (station code), or list[str] (station codes). "
+                "str (station code or JSON path), list[str] (station codes). "
                 f"Got: {type(data).__name__}"
+            )
+
+        if data.empty:
+            raise ValueError(
+                "No valid station data could be retrieved. "
+                "Please verify the station codes and try again."
             )
 
         # -- extract identifier columns so we can reattach them ---------
@@ -241,6 +296,22 @@ class TOARInference:
         identifiers = data[id_cols + gt_cols].copy().reset_index(drop=True)
 
         return data.reset_index(drop=True), identifiers
+
+    @staticmethod
+    def _report_skipped_codes(
+        requested: list[str], fetched_df: pd.DataFrame
+    ) -> None:
+        """Print a warning listing any station codes that could not be fetched."""
+        if fetched_df.empty:
+            fetched_codes = set()
+        else:
+            fetched_codes = set(fetched_df["area_code"].values)
+        skipped = [c for c in requested if c not in fetched_codes]
+        if skipped:
+            print(
+                f"⚠️  The following station code(s) could not be retrieved "
+                f"and were skipped — please verify them:\n  {skipped}"
+            )
 
     # ------------------------------------------------------------------
     # Preprocessing helpers
