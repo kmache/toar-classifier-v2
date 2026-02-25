@@ -1,4 +1,4 @@
-## TOAR-classifier v2: A data-driven classification tool for global air quality stations
+# TOAR-classifier v2: A data-driven classification tool for global air quality stations
 
 This project implements machine learning approaches to obtain an objective station classification for global air quality monitoring stations as described in [1]. It has been developed in support of the international Tropospheric Ozone Assessment Report initiative, phase 2 (TOAR-II) [2]. 
 
@@ -10,12 +10,13 @@ The tool processes metadata from the TOAR database [3]—specifically "global me
 
 The project has been refactored into a modular library to improve maintainability and ease of use:
 
-- **`configs/`**: Placeholder for configuration files and experiment parameters.
+- **`configs/`**: Configuration files and experiment parameters (e.g., `model_params.yaml`).
 - **`data/`**: Datasets used for training and testing, including machine learning model predictions.
 - **`figures/`**: Visualizations and figures.
 - **`models/`**: Storage for trained model artifacts and processors (`.pkl` files).
 - **`notebooks/`**:
   - `01_eda_traning.ipynb`: Main Jupyter notebook for exploratory data analysis and model training.
+  - `02_run_inference.ipynb`: Example notebook demonstrating end-to-end inference using the `src` library.
 - **`script/`**: 
   - `dataloader.py`: Utilities to fetch station metadata from the TOAR-II API.
 - **`src/`**: Core modular codebase:
@@ -58,7 +59,7 @@ Ensure you have Python 3.12 installed along with either Jupyter Notebook, Jupyte
 
 5. **Run the analysis:**
    Open `notebooks/01_eda_traning.ipynb` and select the `toar-v2` kernel.
-   Run all ``notebooks/01_eda_traning.ipynb`
+   Run all cells in `notebooks/01_eda_traning.ipynb`.
 
 ## 🛠 Usage (Inference)
 
@@ -78,17 +79,18 @@ print(results[["area_code", "pred_voting"]])
 See examples in `notebooks/02_run_inference.ipynb`
 
 
-[1] Our paper https://egusphere.copernicus.org/preprints/2025/egusphere-2025-1399/
+[1] Mache, R. K., Schröder, S., Langguth, M., Patnala, A., & Schultz, M. G. (2025). *TOAR-classifier v2: A data-driven classification tool for global air quality stations*. EGUsphere preprint. https://egusphere.copernicus.org/preprints/2025/egusphere-2025-1399/
 
-[2] a reference to https://igacproject.org/activities/TOAR/TOAR-II
+[2] TOAR-II: Tropospheric Ozone Assessment Report, Phase 2. IGAC Project. https://igacproject.org/activities/TOAR/TOAR-II
 
-[3] a reference to https://toar-data.fz-juelich.de
+[3] TOAR Data Infrastructure. Forschungszentrum Jülich. https://toar-data.fz-juelich.de
 
 
 ### Citation
 
 If you use this please cite
 
+```bibtex
 @article{Mache2025TOARClassifier,
   author = {Ramiyou Karim Mache and Sabine Schröder and Michael Langguth and Ankit Patnala and Martin G. Schultz},
   title = {TOAR-classifier v2: A data-driven classification tool for global air quality stations},
@@ -96,4 +98,5 @@ If you use this please cite
   note = {Correspondence: Ramiyou Karim Mache (k.mache@fz-juelich.de)},
   url = {https://egusphere.copernicus.org/preprints/2025/egusphere-2025-1399/}
 }
+```
 
