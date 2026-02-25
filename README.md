@@ -1,8 +1,10 @@
 # TOAR-classifier v2: A data-driven classification tool for global air quality stations
 
-This project implements machine learning approaches to obtain an objective station classification for global air quality monitoring stations as described in [1]. It has been developed in support of the international Tropospheric Ozone Assessment Report initiative, phase 2 (TOAR-II) [2]. 
+This project implements end-to-end machine learning for an objective station classification for global air quality monitoring stations as described in [1]. It has been developed in support of the international Tropospheric Ozone Assessment Report initiative, phase 2 (TOAR-II) [2]. 
 
-The tool processes metadata from the TOAR database [3]—specifically "global metadata" derived from Earth Observation satellite products—to classify measurement sites as **"urban"**, **"suburban"**, or **"rural"**. This second version (v2) features a modular architecture designed for both research (via notebooks) and production-ready inference (via the `src/` library).
+TOAR has implemented a terabyte-scale database for global air quality data [3] with multiannual time series from over 23,000 stations. The objective of the station classification performed in this project is to create objective labels for the measurement sites as **"urban"**, **"suburban"**, or **"rural"** based on various features that provide hints of the characteristics of a station location. To this end, the machine learning models implemented here make use of the extensive metadata in the TOAR database, in particular the "global metadata" that is derived from various Earth Observation satellite data products (for details, see [1])
+
+This second version (v2) features a modular architecture designed for both research (via notebooks) and production-ready inference (via the `src/` library).
 
 <img src="./figures/toar_classifier_v2.png" alt="TOAR Classifier V2" width="400">
 
