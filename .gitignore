@@ -17,7 +17,7 @@ __pycache__/
 data/.ipynb_checkpoints
 
 # Project specific
-catboost_info/
+notebooks/catboost_info/
 models/*.pkl
 figures/*.jpg
 
