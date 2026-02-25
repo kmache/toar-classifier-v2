@@ -6,7 +6,7 @@ TOAR has implemented a terabyte-scale database for global air quality data [3] w
 
 This second version (v2) features a modular architecture designed for both research (via notebooks) and production-ready inference (via the `src/` library).
 
-<img src="./figures/toar_classifier_v2.png" alt="TOAR Classifier V2" width="400">
+<img src="./figures/toar_classifier_v2.png" alt="TOAR Classifier V2" width="1200">
 
 ## 📁 Project Structure
 
