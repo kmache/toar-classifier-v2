@@ -58,6 +58,7 @@ Ensure you have Python 3.12 installed along with either Jupyter Notebook, Jupyte
 
 5. **Run the analysis:**
    Open `notebooks/01_eda_traning.ipynb` and select the `toar-v2` kernel.
+   Run all ``notebooks/01_eda_traning.ipynb`
 
 ## 🛠 Usage (Inference)
 
@@ -67,12 +68,14 @@ You can use the modular `src` library to run predictions for specific stations:
 from src.inference import TOARInference
 
 # Initialize inference pipeline
-infer = TOARInference(models_dir="models", best_model="voting")
+infer = TOARInference(models_dir="models", best_model="voting", verbose=False)
 
 # Predict using a list of TOAR station codes
 results = infer.predict(["DE0001A", "FR0123X"])
 print(results[["area_code", "pred_voting"]])
 ```
+
+See examples in `notebooks/02_run_inference.ipynb`
 
 
 [1] Our paper https://egusphere.copernicus.org/preprints/2025/egusphere-2025-1399/
